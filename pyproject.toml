@@ -1,0 +1,17 @@
+[project]
+name = "nanogpt-speedrun-rtx5090x1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=5.0.1",
+    "huggingface-hub>=1.29.0",
+    "kernels>=0.16.1",
+    "numpy>=2.5.2",
+    "setuptools>=84.0.0",
+    "tiktoken>=0.14.0",
+    "torch==2.10",
+    "tqdm>=4.70.0",
+    "typing-extensions==4.15.0",
+]
