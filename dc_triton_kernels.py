@@ -19,6 +19,13 @@ DC_POSTONLY_CORR_BWD_WSMALL_PRE_WARPS = 8
 DC_POSTONLY_CORR_BWD_WSMALL_QK_WARPS = 4
 DC_POSTONLY_CORR_BWD_WSMALL_PRE_STAGES = 1
 DC_POSTONLY_CORR_BWD_WSMALL_QK_STAGES = 2
+DC_POSTONLY_CORR_FWD_STAGES = 3
+
+# The configs above are tuned for H100 (227 KB shared memory per block). Consumer GPUs
+# such as the RTX 5090 only have ~99 KB, so reduce the software-pipelining depth there.
+if torch.cuda.is_available() and torch.cuda.get_device_properties("cuda").shared_memory_per_block_optin < 160 * 1024:
+    DC_POSTONLY_CORR_BWD_WSMALL_QK_STAGES = 1
+    DC_POSTONLY_CORR_FWD_STAGES = 1
 
 
 @triton.jit
@@ -1033,7 +1040,7 @@ def _dc_attention_postonly_correction_add_base_forward_impl(
         STORE_A_BUF=False,
         ADD_BASE=True,
         num_warps=(8 if block_m >= 32 else 4),
-        num_stages=3,
+        num_stages=int(DC_POSTONLY_CORR_FWD_STAGES),
     )
     if return_aux:
         return out, lse_for_bwd, doc_start_table, doc_end_table

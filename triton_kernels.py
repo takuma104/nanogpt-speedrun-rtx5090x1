@@ -1,7 +1,30 @@
+import functools
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+# -----------------------------------------------------------------------------
+# Shared-memory budget helpers.
+# The tile configs below were autotuned on H100 (227 KB of shared memory per block).
+# Consumer GPUs (e.g. RTX 4090 / RTX 5090) only offer ~99 KB, so the software-pipelining
+# depth (num_stages) and some tile shapes must be reduced there or Triton fails with
+# "out of resource: shared memory".
+
+@functools.lru_cache(maxsize=None)
+def smem_per_block() -> int:
+    return torch.cuda.get_device_properties("cuda").shared_memory_per_block_optin
+
+SMEM_MARGIN = 4 * 1024  # leave some slack for barriers / scratch used by Triton
+
+def is_small_smem() -> bool:
+    return smem_per_block() < 160 * 1024
+
+def fit_num_stages(preferred: int, bytes_per_stage: int, extra_bytes: int = 0) -> int:
+    """Largest num_stages <= preferred whose pipelined tiles fit in shared memory."""
+    budget = smem_per_block() - SMEM_MARGIN - extra_bytes
+    return max(1, min(preferred, budget // bytes_per_stage))
+
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -117,6 +140,9 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     else:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
         num_stages, num_warps = 4, 8
+    if is_small_smem():
+        BLOCK_SIZE_K = 64
+        num_stages = fit_num_stages(num_stages, (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K * A.element_size())
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -254,6 +280,9 @@ def XTX(A: torch.Tensor, out: torch.Tensor):
     else:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
         num_stages, num_warps = 4, 8
+    if is_small_smem():
+        BLOCK_SIZE_K = 64
+        num_stages = fit_num_stages(num_stages, (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K * A.element_size())
 
     grid = (batch_size * triton.cdiv(K, BLOCK_SIZE_M) * triton.cdiv(K, BLOCK_SIZE_N),)
     XTX_kernel[grid](
@@ -372,6 +401,8 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     # Hardcoded config based on H100 autotuning (M=768)
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
     num_stages, num_warps = 4, 8
+    if is_small_smem():
+        num_stages = fit_num_stages(num_stages, (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K * A.element_size())
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     ba_plus_cAA_kernel[grid](
@@ -594,7 +625,7 @@ def linear_relu_square(
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_N = 128 if is_small_smem() else 256
     BLOCK_SIZE_K = 128 if use_fp8 else 64
 
     FORWARD = False
@@ -608,6 +639,11 @@ def linear_relu_square(
 
     num_stages = 4 if FORWARD else 3
     num_warps = 8
+    # TMA operand tiles per pipeline stage + epilogue tiles (output, and `aux` on the backward path)
+    smem_per_stage = (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K * (1 if use_fp8 else 2)
+    epilogue_smem = BLOCK_SIZE_M * (BLOCK_SIZE_N // 2) * 2 * (1 if FORWARD else 2)
+    if is_small_smem():
+        num_stages = fit_num_stages(num_stages, smem_per_stage, epilogue_smem)
 
     a_kernel = a_f8 if use_fp8 else a
     a_desc = TensorDescriptor.from_tensor(a_kernel, [BLOCK_SIZE_M, BLOCK_SIZE_K])
@@ -624,6 +660,8 @@ def linear_relu_square(
             post_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2]
         )
         num_stages = 3
+        if is_small_smem():
+            num_stages = fit_num_stages(num_stages, smem_per_stage, epilogue_smem + BLOCK_SIZE_M * (BLOCK_SIZE_N // 2))
     else:
         post_fp8 = None
         post_fp8_desc = aux_desc

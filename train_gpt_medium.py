@@ -920,7 +920,20 @@ class AttnArgs:
     attn_scale: float
     key_offset: bool
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+def load_flash_attn_interface():
+    # FlashAttention-3 is built for Hopper (sm_90a) and Ampere (sm_80) only. On other GPUs
+    # (e.g. RTX 5090 / Blackwell sm_120) fall back to FlashAttention-2, whose
+    # flash_attn_varlen_func has a compatible signature (varlen + causal + sliding window).
+    try:
+        return get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
+    except RuntimeError as e:
+        if "does not support the current device" not in str(e):
+            raise
+        if master_process:
+            print(f"flash-attn3 is not supported on {torch.cuda.get_device_name()} (sm_{''.join(map(str, torch.cuda.get_device_capability()))}), falling back to flash-attn2")
+        return get_kernel('kernels-community/flash-attn2', version=1).flash_attn_interface
+
+flash_attn_interface = load_flash_attn_interface()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):

@@ -54,7 +54,12 @@ dynamo.config.recompile_limit = 64
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+# The reference 8xH100 (80 GB) setup runs one micro-batch per GPU per step. GPUs with less memory
+# (e.g. a single 32 GB RTX 5090) need smaller micro-batches, so split each step into more of them.
+# This keeps the effective batch size (and the optimizer math) unchanged. Override with GRAD_ACCUM_STEPS.
+_gpu_mem_gb = torch.cuda.get_device_properties(int(os.environ.get("LOCAL_RANK", 0))).total_memory / 1024**3
+grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", (8 // world_size) * (1 if _gpu_mem_gb >= 48 else 2)))
+assert grad_accum_steps % (8 // world_size) == 0, "grad_accum_steps must be a multiple of 8 // world_size"
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -1066,7 +1071,20 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
+def load_flash_attn_interface():
+    # FlashAttention-3 is built for Hopper (sm_90a) and Ampere (sm_80) only. On other GPUs
+    # (e.g. RTX 5090 / Blackwell sm_120) fall back to FlashAttention-2, whose
+    # flash_attn_varlen_func has a compatible signature (varlen + causal + sliding window).
+    try:
+        return get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
+    except RuntimeError as e:
+        if "does not support the current device" not in str(e):
+            raise
+        if master_process:
+            print(f"flash-attn3 is not supported on {torch.cuda.get_device_name()} (sm_{''.join(map(str, torch.cuda.get_device_capability()))}), falling back to flash-attn2")
+        return get_kernel('kernels-community/flash-attn2', version=1).flash_attn_interface
+
+flash_attn_interface = load_flash_attn_interface()
 
 
 def dc_gate(
@@ -1686,10 +1704,17 @@ class GPT(nn.Module):
             prefix_target_seq = self.prefix_table[target_seq]
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
-            logits = self.lm_head(x)
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            logits_for_loss = logits.float()
-            loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+            # Materializing the full (tokens, vocab) logits at the validation batch size needs ~25 GiB (bf16)
+            # + ~50 GiB (fp32), fine on 80 GB H100s but not on 32 GB consumer GPUs (e.g. RTX 5090).
+            # Chunk over tokens; the per-token losses are identical.
+            x_flat = x.view(-1, x.size(-1))
+            chunk_size = 16384
+            losses = []
+            for i in range(0, x_flat.size(0), chunk_size):
+                logits = self.lm_head(x_flat[i:i + chunk_size])
+                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+                losses.append(F.cross_entropy(logits.float(), target_seq[i:i + chunk_size], reduction="none"))
+            loss_per_token = torch.cat(losses)
         return loss_per_token
 # -----------------------------------------------------------------------------
 # Distributed data loader
