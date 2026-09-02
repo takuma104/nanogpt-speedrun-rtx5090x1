@@ -16,6 +16,7 @@ import triton.language as tl
 DC_POSTONLY_CORR_FWD_WSMALL_BLOCK_K = 128
 DC_POSTONLY_CORR_BWD_WSMALL_BLOCK_K = 128
 DC_POSTONLY_CORR_BWD_WSMALL_PRE_WARPS = 8
+DC_POSTONLY_CORR_BWD_WSMALL_PRE_SUB_K = 64
 DC_POSTONLY_CORR_BWD_WSMALL_QK_WARPS = 4
 DC_POSTONLY_CORR_BWD_WSMALL_PRE_STAGES = 1
 DC_POSTONLY_CORR_BWD_WSMALL_QK_STAGES = 2
@@ -447,25 +448,12 @@ def _dc_postonly_corr_fwd_wsmall_cached_kernel(
     )
 
 @triton.jit
-def _dc_postonly_probs_loop_head(
-    Q,
-    K,
-    POST_W1,
-    q_offs,
-    k_offs,
-    d_offs,
-    q_mask,
-    d_mask,
-    valid,
-    lse,
-    stride_qt,
-    stride_qh,
-    stride_qd,
-    stride_kt,
-    stride_kh,
-    stride_kd,
-    stride_wt,
-    stride_wh,
+def _dc_bwd_pre_probs_head(
+    Q, K, POST_W1, LSE,
+    q_offs, k_offs, d_offs, q_mask, valid,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_wt, stride_wh, stride_lt, stride_lh,
     scaling,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -473,17 +461,16 @@ def _dc_postonly_probs_loop_head(
     q = tl.load(
         Q + q_offs[:, None].to(tl.int64) * stride_qt + H * stride_qh
         + d_offs[None, :].to(tl.int64) * stride_qd,
-        mask=q_mask[:, None] & d_mask[None, :],
+        mask=q_mask[:, None],
         other=0.0,
     )
     k_load_offs = tl.minimum(k_offs, T - 1)
     k = tl.load(
         K + k_load_offs[:, None].to(tl.int64) * stride_kt + H * stride_kh
         + d_offs[None, :].to(tl.int64) * stride_kd,
-        mask=d_mask[None, :],
-        other=0.0,
     )
-    score = tl.dot(q, tl.trans(k), input_precision="tf32") * (scaling * 1.4426950408889634)
+    lse = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + H * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
+    score = tl.dot(q, tl.trans(k)) * (scaling * 1.4426950408889634)
     probs = tl.exp2(score - (lse * 1.4426950408889634)[:, None])
     probs = tl.where(valid, probs, 0.0)
     w1 = tl.load(
@@ -493,110 +480,48 @@ def _dc_postonly_probs_loop_head(
     ).to(tl.float32)
     return probs, w1
 
+
 @triton.jit
-def _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-    V,
-    DO,
-    POST_W2,
-    DV,
-    GPOST_W2,
-    da_acc,
+def _dc_bwd_pre_dm_head(
+    V, DO, POST_W2, DV,
     a_hidden,
-    q_offs,
-    k_offs,
-    rel,
-    valid,
-    q_mask,
-    d_offs,
-    d_mask,
-    stride_vt,
-    stride_vh,
-    stride_vd,
-    stride_dot,
-    stride_doh,
-    stride_dod,
-    stride_w2t,
-    stride_w2h,
-    stride_dv_t,
-    stride_dv_h,
-    stride_dv_d,
-    stride_gwt,
-    stride_gwh,
+    q_offs, k_offs, d_offs, q_mask,
+    stride_vt, stride_vh, stride_vd,
+    stride_dot, stride_doh, stride_dod,
+    stride_w2t, stride_w2h,
+    stride_dv_t, stride_dv_h, stride_dv_d,
     T: tl.constexpr,
     H: tl.constexpr,
 ):
     do = tl.load(
         DO + H * stride_doh + q_offs[:, None].to(tl.int64) * stride_dot
         + d_offs[None, :].to(tl.int64) * stride_dod,
-        mask=q_mask[:, None] & d_mask[None, :],
+        mask=q_mask[:, None],
         other=0.0,
     )
     k_load_offs = tl.minimum(k_offs, T - 1)
     vv = tl.load(
         V + k_load_offs[:, None].to(tl.int64) * stride_vt + H * stride_vh
         + d_offs[None, :].to(tl.int64) * stride_vd,
-        mask=d_mask[None, :],
-        other=0.0,
     )
-    dm = tl.dot(do, tl.trans(vv), input_precision="tf32").to(tl.float32)
+    dm = tl.dot(do, tl.trans(vv))
     w2 = tl.load(
         POST_W2 + q_offs.to(tl.int64) * stride_w2t + H * stride_w2h,
         mask=q_mask,
         other=0.0,
     ).to(tl.float32)
-    a_hidden = tl.where(valid, a_hidden, 0.0)
     dv_weight = w2[:, None] * a_hidden
-    dv_blk = tl.dot(tl.trans(dv_weight.to(do.dtype)), do, input_precision="tf32")
+    dv_blk = tl.dot(tl.trans(dv_weight.to(do.dtype)), do)
     tl.atomic_add(
         DV + k_offs[:, None].to(tl.int64) * stride_dv_t + H * stride_dv_h
         + d_offs[None, :].to(tl.int64) * stride_dv_d,
         dv_blk,
         sem="relaxed",
-        mask=(k_offs[:, None] < T) & d_mask[None, :],
+        mask=k_offs[:, None] < T,
     )
     gpost_w2 = tl.sum(dm * a_hidden, axis=1)
-    tl.store(
-        GPOST_W2 + q_offs.to(tl.int64) * stride_gwt + H * stride_gwh,
-        gpost_w2,
-        mask=q_mask,
-    )
-    return da_acc + w2[:, None] * dm
+    return w2[:, None] * dm, gpost_w2
 
-@triton.jit
-def _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-    POST_W1,
-    SOFT_DOT,
-    GPOST_W1,
-    probs,
-    da_acc,
-    q_offs,
-    q_mask,
-    stride_wt,
-    stride_wh,
-    stride_sdt,
-    stride_sdh,
-    stride_gwt,
-    stride_gwh,
-    H: tl.constexpr,
-):
-    w1 = tl.load(
-        POST_W1 + q_offs.to(tl.int64) * stride_wt + H * stride_wh,
-        mask=q_mask,
-        other=0.0,
-    ).to(tl.float32)
-    dp = w1[:, None] * da_acc
-    soft_dot = tl.sum(dp * probs, axis=1)
-    gpost_w1 = tl.sum(da_acc * probs, axis=1)
-    tl.store(
-        SOFT_DOT + q_offs.to(tl.int64) * stride_sdt + H * stride_sdh,
-        soft_dot,
-        mask=q_mask,
-    )
-    tl.store(
-        GPOST_W1 + q_offs.to(tl.int64) * stride_gwt + H * stride_gwh,
-        gpost_w1,
-        mask=q_mask,
-    )
 
 @triton.jit
 def _dc_postonly_corr_bwd_pre_wsmall_kernel(
@@ -649,141 +574,174 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SUB_K: tl.constexpr,
 ):
+    # Same math as the original single-tile kernel, but the BLOCK_K key window is processed in
+    # SUB_K-sized chunks so that only a few small tiles are live at any time. The original version
+    # kept six (BLOCK_M, BLOCK_K) probability tiles plus 128x128 K/V/dV tiles live simultaneously,
+    # which made ptxas spill tens of KB per thread (the kernel was ~50x slower than its forward).
+    tl.static_assert(BLOCK_K % SUB_K == 0)
     pid_m = tl.program_id(0)
     q_start = pid_m * BLOCK_M
     q_offs = q_start + tl.arange(0, BLOCK_M)
     k_start = q_start - WINDOW + 1
     if k_start < 0:
         k_start = 0
-    k_offs = k_start + tl.arange(0, BLOCK_K)
     d_offs = tl.arange(0, BLOCK_D)
     q_mask = q_offs < T
-    d_mask = d_offs < BLOCK_D
     doc_start = tl.load(DOC_START_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     doc_end = tl.load(DOC_END_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
-    rel = q_offs[:, None] - k_offs[None, :]
-    valid = (
-        q_mask[:, None]
-        & (k_offs[None, :] < T)
-        & (rel >= 0)
-        & (rel < WINDOW)
-        & (k_offs[None, :] >= doc_start[:, None])
-        & (k_offs[None, :] < doc_end[:, None])
-    )
 
-    lse0 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 0 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    lse1 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 1 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    lse2 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 2 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    lse3 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 3 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    lse4 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 4 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    lse5 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 5 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
-    p0, _w10 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse0,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=0,
-    )
-    p1, _w11 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse1,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=1,
-    )
-    p2, _w12 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse2,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=2,
-    )
-    p3, _w13 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse3,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=3,
-    )
-    p4, _w14 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse4,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=4,
-    )
-    p5, _w15 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse5,
-        stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
-        stride_w1t, stride_w1h, scaling, T=T, H=5,
-    )
+    sd0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sd1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sd2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sd3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sd4 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sd5 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g10 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g11 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g12 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g13 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g14 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g15 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g20 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g21 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g22 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g23 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g24 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    g25 = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    a_hidden = (
-        _w10[:, None] * p0
-        + _w11[:, None] * p1
-        + _w12[:, None] * p2
-        + _w13[:, None] * p3
-        + _w14[:, None] * p4
-        + _w15[:, None] * p5
-    )
-    da_acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=0,
-    )
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=1,
-    )
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=2,
-    )
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=3,
-    )
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=4,
-    )
-    da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
-        stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
-        stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
-        stride_gwt, stride_gwh, T=T, H=5,
-    )
-    tl.store(
-        DA_BUF + q_offs[:, None].to(tl.int64) * stride_at + rel.to(tl.int64) * stride_aw,
-        da_acc,
-        mask=valid,
-    )
+    for kb in tl.range(0, BLOCK_K, SUB_K):
+        k_offs = k_start + kb + tl.arange(0, SUB_K)
+        rel = q_offs[:, None] - k_offs[None, :]
+        valid = (
+            q_mask[:, None]
+            & (k_offs[None, :] < T)
+            & (rel >= 0)
+            & (rel < WINDOW)
+            & (k_offs[None, :] >= doc_start[:, None])
+            & (k_offs[None, :] < doc_end[:, None])
+        )
+        p0, w10 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=0,
+        )
+        p1, w11 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=1,
+        )
+        p2, w12 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=2,
+        )
+        p3, w13 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=3,
+        )
+        p4, w14 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=4,
+        )
+        p5, w15 = _dc_bwd_pre_probs_head(
+            Q, K, POST_W1, LSE, q_offs, k_offs, d_offs, q_mask, valid,
+            stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
+            stride_w1t, stride_w1h, stride_lt, stride_lh, scaling, T=T, H=5,
+        )
+        a_hidden = (
+            w10[:, None] * p0
+            + w11[:, None] * p1
+            + w12[:, None] * p2
+            + w13[:, None] * p3
+            + w14[:, None] * p4
+            + w15[:, None] * p5
+        )
+        a_hidden = tl.where(valid, a_hidden, 0.0)
 
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p0, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=0,
-    )
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p1, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=1,
-    )
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p2, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=2,
-    )
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p3, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=3,
-    )
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p4, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=4,
-    )
-    _dc_postonly_corr_bwd_pre_wsmall_soft_head(
-        POST_W1, SOFT_DOT, GPOST_W1, p5, da_acc, q_offs, q_mask,
-        stride_w1t, stride_w1h, stride_sdt, stride_sdh, stride_gwt, stride_gwh, H=5,
-    )
+        da_acc, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=0,
+        )
+        g20 += g
+        da, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=1,
+        )
+        da_acc += da
+        g21 += g
+        da, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=2,
+        )
+        da_acc += da
+        g22 += g
+        da, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=3,
+        )
+        da_acc += da
+        g23 += g
+        da, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=4,
+        )
+        da_acc += da
+        g24 += g
+        da, g = _dc_bwd_pre_dm_head(
+            V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
+            stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
+            stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=5,
+        )
+        da_acc += da
+        g25 += g
+
+        tl.store(
+            DA_BUF + q_offs[:, None].to(tl.int64) * stride_at + rel.to(tl.int64) * stride_aw,
+            da_acc,
+            mask=valid,
+        )
+
+        sd0 += tl.sum(w10[:, None] * da_acc * p0, axis=1)
+        g10 += tl.sum(da_acc * p0, axis=1)
+        sd1 += tl.sum(w11[:, None] * da_acc * p1, axis=1)
+        g11 += tl.sum(da_acc * p1, axis=1)
+        sd2 += tl.sum(w12[:, None] * da_acc * p2, axis=1)
+        g12 += tl.sum(da_acc * p2, axis=1)
+        sd3 += tl.sum(w13[:, None] * da_acc * p3, axis=1)
+        g13 += tl.sum(da_acc * p3, axis=1)
+        sd4 += tl.sum(w14[:, None] * da_acc * p4, axis=1)
+        g14 += tl.sum(da_acc * p4, axis=1)
+        sd5 += tl.sum(w15[:, None] * da_acc * p5, axis=1)
+        g15 += tl.sum(da_acc * p5, axis=1)
+
+    q64 = q_offs.to(tl.int64)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 0 * stride_sdh, sd0, mask=q_mask)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 1 * stride_sdh, sd1, mask=q_mask)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 2 * stride_sdh, sd2, mask=q_mask)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 3 * stride_sdh, sd3, mask=q_mask)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 4 * stride_sdh, sd4, mask=q_mask)
+    tl.store(SOFT_DOT + q64 * stride_sdt + 5 * stride_sdh, sd5, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 0 * stride_gwh, g10, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 1 * stride_gwh, g11, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 2 * stride_gwh, g12, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 3 * stride_gwh, g13, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 4 * stride_gwh, g14, mask=q_mask)
+    tl.store(GPOST_W1 + q64 * stride_gwt + 5 * stride_gwh, g15, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 0 * stride_gwh, g20, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 1 * stride_gwh, g21, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 2 * stride_gwh, g22, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 3 * stride_gwh, g23, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 4 * stride_gwh, g24, mask=q_mask)
+    tl.store(GPOST_W2 + q64 * stride_gwt + 5 * stride_gwh, g25, mask=q_mask)
 
 @triton.jit
 def _dc_postonly_corr_bwd_qk_wsmall_kernel(
@@ -1088,7 +1046,8 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
     cu_search_iters = max(1, n_docs.bit_length())
     small_block_m = 16
     small_block_k = int(DC_POSTONLY_CORR_BWD_WSMALL_BLOCK_K)
-    dv = torch.zeros_like(v)
+    # Accumulate dV in fp32: bf16 atomics are emulated with CAS loops on consumer GPUs (very slow).
+    dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
     da_buf = torch.empty((B, T, int(window)), device=q.device, dtype=torch.float32)
     soft_dot = torch.empty((B, T, H), device=q.device, dtype=torch.float32)
     gpost_w1 = torch.empty_like(post_w1, memory_format=torch.contiguous_format)
@@ -1145,15 +1104,16 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
         BLOCK_M=small_block_m,
         BLOCK_K=small_block_k,
         BLOCK_D=128,
+        SUB_K=int(DC_POSTONLY_CORR_BWD_WSMALL_PRE_SUB_K),
         num_warps=int(DC_POSTONLY_CORR_BWD_WSMALL_PRE_WARPS),
         num_stages=int(DC_POSTONLY_CORR_BWD_WSMALL_PRE_STAGES),
     )
 
     if skip_qk_grad_requested:
-        return None, None, dv, gpost_w1, gpost_w2
+        return None, None, dv.to(v.dtype), gpost_w1, gpost_w2
 
     dq = torch.empty_like(q)
-    dk = torch.zeros_like(k)
+    dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)  # fp32 accumulation (see dv)
     grid_qk_small = (triton.cdiv(T, small_block_m), H)
     _dc_postonly_corr_bwd_qk_wsmall_kernel[grid_qk_small](
         q,
@@ -1197,7 +1157,7 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
         num_warps=int(DC_POSTONLY_CORR_BWD_WSMALL_QK_WARPS),
         num_stages=int(DC_POSTONLY_CORR_BWD_WSMALL_QK_STAGES),
     )
-    return dq, dk, dv, gpost_w1, gpost_w2
+    return dq, dk.to(k.dtype), dv.to(v.dtype), gpost_w1, gpost_w2
 
 
 class _DCPostOnlyCorrectionAddBaseTriton(torch.autograd.Function):
