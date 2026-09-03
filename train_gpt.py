@@ -1981,7 +1981,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 30))  # number of steps to continue training at final lr and ws (15 in the reference; +15 buys back the sampled-softmax bias)
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 35))  # number of steps to continue training at final lr and ws (15 in the reference; +20 buys back the sampled-softmax bias)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -2091,8 +2091,8 @@ training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterati
 # a 32k-token micro-batch), a 14336 -> 24576 ramp through the last stage, and the full softmax for the final
 # SNS_FULL_SOFTMAX_STEPS steps. Following upstream PR #360 (@devenpzak).
 SNS_CANDIDATES_PER_STAGE = [int(os.environ.get("SNS_P12", 10240))] * 2 + [14336]
-SNS_CANDIDATE_RAMP = {2: [int(v) for v in os.environ.get("SNS_P3_RAMP", "14336").split(",")]}  # constant in the last stage (the 14336->24576 ramp was not needed with the partial log-Q correction)
-SNS_FULL_SOFTMAX_STEPS = int(os.environ.get("SNS_FULL_SOFTMAX_STEPS", 60))
+SNS_CANDIDATE_RAMP = {2: [int(v) for v in os.environ.get("SNS_P3_RAMP", "14336,14336,24576").split(",")]}
+SNS_FULL_SOFTMAX_STEPS = int(os.environ.get("SNS_FULL_SOFTMAX_STEPS", 100))
 SNS_START = int(os.environ.get("SNS_START", 0))  # optional full-softmax head (did not help in Exp 8->9)
 SNS_STRIDE = 20011  # coprime with the vocab: k * stride mod V sweeps a permutation of the classes
 SNS_LOGQ_SCALE = float(os.environ.get("SNS_LOGQ_SCALE", 0.5))  # partial log-Q correction: 1.0 is unbiased but noisy (worse final loss), 0 is biased; 0.5 measured best
