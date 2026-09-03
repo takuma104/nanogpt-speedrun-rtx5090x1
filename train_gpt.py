@@ -60,7 +60,10 @@ assert 8 % world_size == 0, "world_size must be a divisor of 8"
 _gpu_mem_gb = torch.cuda.get_device_properties(int(os.environ.get("LOCAL_RANK", 0))).total_memory / 1024**3
 grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", (8 // world_size) * (1 if _gpu_mem_gb >= 48 else 2)))
 assert grad_accum_steps % (8 // world_size) == 0, "grad_accum_steps must be a multiple of 8 // world_size"
-grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
+# Gradient normalization of the reference 8-GPU setup: each rank sums its 1/8 of the batch, then the
+# gradients are averaged over the 8 ranks, i.e. grad = (1/8) * sum over the batch. Reproduce that
+# exactly regardless of how the per-rank batch is split into micro-batches (the loss below is a sum).
+grad_scale = world_size / 8
 # Training micro-batches: the reference setup runs one 1/8-batch micro-batch per GPU (grad_accum_steps = 8 // world_size).
 # On smaller GPUs, use the largest training micro-batch that fits instead (at most MAX_MICRO_BATCH_TOKENS tokens),
 # per training stage (see TrainingManager.advance_schedule). The optimizer math only depends on the effective batch.
@@ -1233,7 +1236,6 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
-    grad_scale: float
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1730,8 +1732,7 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
-            grad_scale = schedule_cfg.grad_scale  # 1 / (training micro-batches per step), per stage
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, grad_scale * 0.75 / 448, grad_scale)
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             # Materializing the full (tokens, vocab) logits at the validation batch size needs ~25 GiB (bf16)
             # + ~50 GiB (fp32), fine on 80 GB H100s but not on 32 GB consumer GPUs (e.g. RTX 5090).
@@ -2183,8 +2184,7 @@ class TrainingManager():
             prefix_weight = self.prefix_weight,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
-            train_max_seq_len = self.train_max_seq_len,
-            grad_scale = self.grad_scale,
+            train_max_seq_len = self.train_max_seq_len
         )
 
     def _is_adam_step(self, step: int):
@@ -2205,7 +2205,6 @@ class TrainingManager():
         new_train_max_seq_len = stage.train_max_seq_len
         if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
             self.grad_accum_steps = get_train_grad_accum_steps(new_batch_size)
-            self.grad_scale = 1 / self.grad_accum_steps
             self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, self.grad_accum_steps)
             self.batch_size = new_batch_size
             self.train_max_seq_len = new_train_max_seq_len
@@ -2246,7 +2245,6 @@ class TrainingManager():
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
         self.grad_accum_steps = get_train_grad_accum_steps(stage.batch_size)
-        self.grad_scale = 1 / self.grad_accum_steps
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -2388,7 +2386,7 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         rows = gather_embedding_rows(model, inputs, bigram_inputs)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * training_manager.grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
@@ -2461,7 +2459,7 @@ for step in range(train_steps + 1):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         rows = gather_embedding_rows(model, inputs, bigram_inputs)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * training_manager.grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
