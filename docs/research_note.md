@@ -9,7 +9,8 @@
 | 2026-09-02 | 1703.7 s | 3.2805 | `logs/c0f0c03b-9c5b-489a-a163-c4fff78b2518.txt` | baseline (H100x8 コードをそのまま RTX5090x1 で実行) |
 | 2026-09-02 | 1429.8 s | 3.2779 | `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` | Exp 1: DC attention backward カーネル書き直し (−16.1%) |
 | 2026-09-03 | 1304.9 s | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
-| 2026-09-03 | **1210.5 s** | 3.2763 | `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` | Exp 3: FP8 MLP backward (−7.2%) |
+| 2026-09-03 | 1210.5 s | 3.2763 | `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` | Exp 3: FP8 MLP backward (−7.2%) |
+| 2026-09-03 | **1093.3 s** | 3.2789 | `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` | Exp 9: sampled softmax 訓練損失（PR #360 移植）+ 拡張 35 step (−9.8%) |
 
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
@@ -176,3 +177,28 @@ codex レビュー P1 の対応（参照 8xH100 の勾配正規化と一致さ�
 
 ### 同一構成の run 間ばらつき（参考）
 Exp 2b/3/5/7 系（最終 val_loss）: 3.2772, 3.2763, 3.2772, 3.2782 → 平均 3.2772, sd 0.0008。train_time は ±0.2%。
+
+### Exp 8: Sampled softmax 訓練損失（upstream PR #360 の移植）（2026-09-03）
+upstream の未マージ PR #360 (@devenpzak, "ANVIL2", 8xH100 で 73.9→39.9 s) のアブレーションで、single GPU に移植可能かつ効果が大きいのが
+「shared-negative sampled softmax（訓練損失のみ、validation は完全な 50304-way softmax のまま）」（H100 で −8.8 s wall, val −2.4 millinats）。
+（最大の要因である 84.6M 行の hashed n-gram table（65B params、8 GPU に shard）は 32 GB では不可能。mixed-width attention は patched FA3 (sm_90) 依存で不可。）
+
+**実装** (`SampledSoftcappedCrossEntropy`, `sns_p_at`, `SampledSoftmaxCandidates`):
+- micro-batch ごとにホスト側で候補集合 C を作る: その micro-batch の全 target ＋ stride 順列 (k·20011 mod V) からの負例、昇順で P 個。target/prefix の C 内位置 (TPOS/PPOS) を渡す（prefix が C に無ければ −1 = 無視）
+- lm_head の fp8 重みから C の行を gather し、logits GEMM / CE カーネル（VOCAB_SIZE=P でコンパイル）/ backward の 2 GEMM を P 幅で実行。重み勾配は (768, V) に zero 埋めで densify
+- P: stage 1-2 = 10240（32k-token micro-batch の unique target は最大 ~7.6k → 34% headroom）、stage 3 = 14336 → 14336 → 24576 のランプ、最後の 100 step は完全 softmax。P の切り替え step は warmup に含める（グラフ再コンパイル回避）
+- 正しさ: C = 全語彙にすると full softmax と loss/勾配が bit-exact。P=10240 で dx の相対差 1.5%
+- コスト: T=8192 の lm_head+CE fwd+bwd 6.5 → 2.1 ms
+
+**bench**: stage1 457→390 ms, stage2 930→793 ms, stage3 (P=14336) 1421→1230 ms（−13〜15%）。予測 train_time ≈ 1060 s。
+**リスク**: 訓練勾配のバイアス → 最終 loss。PR の証拠では val はわずかに改善。
+
+**結果 (loss 未達)**: `logs/3c506227-5f6c-4a28-ad45-03fffcb0ab4d.txt` — **train_time 1060.8 s (−12.5%) だが val_loss 3.2862**（+0.009）。途中の val が大きく悪い（step250 4.76 vs 4.50, step750 3.84 vs 3.69, step1000 3.50 vs 3.42）→ sampled softmax は序盤の学習を大きく遅らせ、最後の 100 step の full softmax で大半を取り戻すが 0.009 残る。PR #360 のアブレーション表を読み直すと、彼らの環境でも sampled softmax は val を 2.4 millinats 悪化させており（wall −8.8 s との交換）、私の環境では 1 GPU あたり micro-batch が 32k tokens（unique target ~7k）なので負例比率が低く、バイアスがより大きい可能性。
+最終 0.009 は終盤の 1 step ≈ 0.0005 換算で ~20 step (~28 s) 相当 → 正味ではまだ −9% 程度の余地。
+
+### Exp 9: Exp 8 + 序盤 100 step は full softmax + 拡張 step 15→35（2026-09-03）
+- `SNS_START=100`: step < 100 は full softmax（序盤の統計学習を邪魔しない; コスト +7 s）
+- `NUM_EXTENSION_ITERATIONS=35`: 最終 LR での拡張 step を 20 増やして loss 差 0.009 を回収（+28 s）
+- 予測: train_time ≈ 1095 s、val_loss ≈ 3.277-3.280
+
+**結果 (採用)**: `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` — **train_time 1093.3 s, val_loss 3.2789**（−9.8%、baseline 比 −35.8%）。3.28 は下回るがマージンは薄い（同構成ノイズ ±0.001）。途中 val は依然として悪い（step250 4.73, step1000 3.51 vs 3.42）→ 序盤 100 step の full softmax は効かず、sampled 期間中のバイアスが主因。`NUM_EXTENSION_ITERATIONS` のデフォルトを 35 に変更してコミット。

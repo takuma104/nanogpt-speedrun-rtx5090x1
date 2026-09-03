@@ -835,6 +835,57 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         return (dx.view(ctx.x_shape), dW1, dW2) + (None,) * 11
 
 
+class SampledSoftcappedCrossEntropy(torch.autograd.Function):
+    """Shared-negative sampled softcapped cross entropy (training only; upstream PR #360 by @devenpzak).
+
+    The softmax runs over a per-micro-batch candidate set `cand` (ascending class ids, P classes) that
+    contains every target of the micro-batch plus negatives; `target_pos` / `prefix_pos` are the targets'
+    positions inside `cand` (-1 = absent -> ignored, like the full kernel). The lm_head rows of the
+    candidates are gathered from the fp8 weight, so the logits GEMM, the CE kernel and both backward
+    GEMMs run at P instead of the 50304-way vocabulary. The weight gradient is densified into the
+    full (model_dim, vocab) layout with zeros for the non-candidate columns."""
+    @staticmethod
+    def forward(ctx, x, target_pos, mtp_weights, prefix_pos, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, cand, A=23.0, B=5.0, C=7.5):
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)                       # (T, D)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)          # (D, V) row-major
+        w_rows = torch.empty((w_f8.shape[1], w_f8.shape[0]), dtype=w_f8.dtype, device=w_f8.device)
+        transpose_copy(w_f8, w_rows)                                    # (V, D) row-major
+        wc = w_rows[cand]                                               # (P, D) row-major
+        x_scale = x.new_tensor(x_s, dtype=torch.float32)
+        w_scale = x.new_tensor(w_s, dtype=torch.float32)
+        logits = torch._scaled_mm(x_f8, wc.T, out_dtype=torch.bfloat16, scale_a=x_scale, scale_b=w_scale, use_fast_accum=True)  # (T, P)
+        n_rows, P = logits.shape
+        n_predict = mtp_weights.shape[0]
+        losses = torch.empty(n_rows, dtype=torch.float32, device=x.device)
+        grad_input = torch.empty((n_rows, P), dtype=torch.float8_e5m2, device=x.device)
+        prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
+        ce_fwd_bwd(logits, target_pos.contiguous(), mtp_weights.contiguous(), prefix_pos.contiguous(), prefix_weight,
+                   losses, grad_input, n_rows, n_rows, n_predict, A, B, C, grad_s, grad_scale, P)
+        ctx.save_for_backward(x_f8, wc, grad_input, cand)
+        ctx.params = (x_s, w_s, grad_s, lm_head_weight.shape)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_f8, wc, grad_input, cand = ctx.saved_tensors
+        x_s, w_s, grad_s, w_shape = ctx.params
+        n_rows, P = grad_input.shape
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+        wct = torch.empty((wc.shape[1], wc.shape[0]), dtype=wc.dtype, device=wc.device)
+        transpose_copy(wc, wct)                                         # (D, P) row-major
+        grad_x = torch._scaled_mm(grad_input, wct.T, out_dtype=torch.bfloat16, scale_a=grad_scale, scale_b=w_scale, use_fast_accum=False)  # (T, D)
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)                                    # (D, T)
+        grad_input_T = torch.empty((P, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)                        # (P, T)
+        gw_c = torch._scaled_mm(x_f8_T, grad_input_T.T, out_dtype=torch.float32, scale_a=x_scale, scale_b=grad_scale, use_fast_accum=False)  # (D, P)
+        grad_w = torch.zeros(w_shape, dtype=torch.float32, device=gw_c.device)
+        grad_w.index_copy_(1, cand, gw_c)
+        return grad_x, None, None, None, None, grad_w, None, None, None, None, None
+
+
 def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
     num_layers, partial_count = partial_amax.shape
     assert scales.numel() >= num_layers
@@ -1276,14 +1327,25 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
-ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
-    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
-    "ce_fwd_bwd_kernel",
-    compute_capability="".join(map(str, torch.cuda.get_device_capability())),  # native SASS for the current GPU
-    cuda_include_dirs=["/usr/local/cuda/include/"],
-    nvcc_options=["-lineinfo", "--use_fast_math"],
-)
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+_CE_KERNELS: dict = {}
+
+def get_ce_kernel(vocab_size: int):
+    """The fused CE kernel compiled for a vocabulary (candidate set) of `vocab_size` classes (multiple of 2048)."""
+    if vocab_size not in _CE_KERNELS:
+        assert vocab_size % 8 == 0, vocab_size  # 16-byte vector loads; the kernel masks the tail beyond full blocks
+        decls = f"constexpr int VOCAB_SIZE = {vocab_size};\nconstexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};\n"
+        k = torch.cuda._compile_kernel(
+            decls + CE_KERNEL_SOURCE,
+            "ce_fwd_bwd_kernel",
+            compute_capability="".join(map(str, torch.cuda.get_device_capability())),  # native SASS for the current GPU
+            cuda_include_dirs=["/usr/local/cuda/include/"],
+            nvcc_options=["-lineinfo", "--use_fast_math"],
+        )
+        k.set_shared_memory_config(vocab_size * 2)
+        _CE_KERNELS[vocab_size] = k
+    return _CE_KERNELS[vocab_size]
+
+ce_fwd_bwd_kernel = get_ce_kernel(CE_KERNEL_VOCAB_SIZE)
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -1302,17 +1364,19 @@ def ce_fwd_bwd(
     C: float,
     grad_s: float,
     grad_scale: float,
+    vocab_size: int,
 ) -> None:
     # n_rows: rows (logits / losses / grad_input) handled by this launch; n_targets: number of valid
     # entries in `targets`, which may extend past n_rows so the multi-token-prediction lookahead of
-    # the last rows of a row chunk still sees the following targets.
+    # the last rows of a row chunk still sees the following targets. vocab_size: number of classes
+    # (the full vocabulary, or the sampled candidate count; targets are then candidate positions).
     grid = (n_rows, 1, 1)
-    ce_fwd_bwd_kernel(
+    get_ce_kernel(vocab_size)(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
         (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
          n_targets, n_predict, A, B, C, grad_s, grad_scale),
-        shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
+        shared_mem=vocab_size * 2,
     )
 
 # Optionally process the (rows, vocab) logits / gradient in row chunks (CE_CHUNK_ROWS=16384 saves ~1.5 GB
@@ -1362,7 +1426,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             )
             ce_fwd_bwd(logits, targets[start:], mtp_weights, prefix_targets[start:], prefix_weight,
                        losses[start:end], grad_input[start:end],
-                       end - start, n_rows - start, n_predict, A, B, C, grad_s, grad_scale)
+                       end - start, n_rows - start, n_predict, A, B, C, grad_s, grad_scale, n_cols)
 
         # Only the fp8 operands are needed for backward; in particular the (rows, vocab) bf16 logits
         # must not be kept alive (they dominate peak memory at large micro-batches).

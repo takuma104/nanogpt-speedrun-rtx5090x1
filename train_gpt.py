@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, SampledSoftcappedCrossEntropy, get_ce_kernel, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
 )
@@ -1522,7 +1522,8 @@ class GPT(nn.Module):
         return gate[..., 28:29]
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig,
-                emb_rows: Tensor | None = None, ve_rows: Tensor | None = None, bigram_rows: Tensor | None = None):
+                emb_rows: Tensor | None = None, ve_rows: Tensor | None = None, bigram_rows: Tensor | None = None,
+                sns_cand: Tensor | None = None, sns_tpos: Tensor | None = None, sns_ppos: Tensor | None = None):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -1731,8 +1732,13 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            if sns_cand is not None:
+                # Sampled (shared-negative) softmax over the micro-batch's candidate set; validation always
+                # uses the full vocabulary (the eval branch below).
+                loss_per_token = SampledSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), sns_tpos, mtp_weights, sns_ppos, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale, sns_cand)
+            else:
+                prefix_target_seq = self.prefix_table[target_seq]
+                loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             # Materializing the full (tokens, vocab) logits at the validation batch size needs ~25 GiB (bf16)
             # + ~50 GiB (fp32), fine on 80 GB H100s but not on 32 GB consumer GPUs (e.g. RTX 5090).
@@ -1951,6 +1957,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True),
             _bigram_inputs.numpy(),
+            _targets.numpy(),  # host copy for the sampled-softmax candidate build
         )
 
         if new_params is not None:
@@ -1974,7 +1981,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 35))  # number of steps to continue training at final lr and ws (15 in the reference; +20 buys back the sampled-softmax bias)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -2077,6 +2084,71 @@ TRAINING_STAGES = [
 # TODO - Confirm.
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+
+# -----------------------------------------------------------------------------
+# Sampled softmax schedule (training loss only; validation is always the full 50304-way softmax).
+# Candidate count P per step: 10240 in the first two stages (34%+ headroom over the ~7.6k unique targets of
+# a 32k-token micro-batch), a 14336 -> 24576 ramp through the last stage, and the full softmax for the final
+# SNS_FULL_SOFTMAX_STEPS steps. Following upstream PR #360 (@devenpzak).
+SNS_CANDIDATES_PER_STAGE = [int(os.environ.get("SNS_P12", 10240))] * 2 + [14336]
+SNS_CANDIDATE_RAMP = {2: [int(v) for v in os.environ.get("SNS_P3_RAMP", "14336,14336,24576").split(",")]}
+SNS_FULL_SOFTMAX_STEPS = int(os.environ.get("SNS_FULL_SOFTMAX_STEPS", 100))
+SNS_START = int(os.environ.get("SNS_START", 100))  # full softmax for the first steps (early learning suffers most from the bias)
+SNS_STRIDE = 20011  # coprime with the vocab: k * stride mod V sweeps a permutation of the classes
+
+def sns_p_at(step: int) -> int:
+    """Candidate count for `step` (0 = full softmax)."""
+    if os.environ.get("DISABLE_SNS", "0") == "1" or step < SNS_START or step >= training_schedule.total_steps - SNS_FULL_SOFTMAX_STEPS:
+        return 0
+    i, (a, b) = next((i, bd) for i, bd in enumerate(training_schedule.boundaries) if step < bd[1])
+    if i >= len(SNS_CANDIDATES_PER_STAGE):
+        return 0
+    ramp = SNS_CANDIDATE_RAMP.get(i)
+    return ramp[(step - a) * len(ramp) // (b - a)] if ramp else SNS_CANDIDATES_PER_STAGE[i]
+
+class SampledSoftmaxCandidates:
+    """Host-side builder of the per-micro-batch candidate set: every target of the micro-batch plus
+    duplicate-free negatives from a fixed stride permutation of the vocabulary, ascending."""
+    def __init__(self, vocab_size: int):
+        self.V = vocab_size
+        self.mark = np.zeros(vocab_size, dtype=bool)
+        self.pos = np.full(vocab_size + 1, -1, dtype=np.int64)   # pos[V] = -1: "no prefix"
+        self.perm = (np.arange(vocab_size, dtype=np.int64) * SNS_STRIDE) % vocab_size
+        self.off = 0
+        self.prefix_table = np.full(vocab_size, -1, dtype=np.int64)  # filled once the prefix table is built
+
+    def build(self, targets_np: np.ndarray, P: int):
+        mark, pos, V = self.mark, self.pos, self.V
+        mark.fill(False)
+        mark[targets_np] = True
+        U = int(np.count_nonzero(mark))
+        assert U <= P, f"[sampled-softmax] {U} unique targets exceed the candidate budget {P}"
+        need = P - U
+        while need > 0:
+            draw = min(V, need * 2 + 256)
+            idx = self.perm[self.off:self.off + draw]
+            self.off = (self.off + draw) % V
+            idx = idx[~mark[idx]]
+            take = idx[:need]
+            mark[take] = True
+            need -= len(take)
+        cand = np.flatnonzero(mark)                              # ascending, exactly P
+        pos[:V] = -1
+        pos[cand] = np.arange(P, dtype=np.int64)
+        tpos = pos[targets_np]
+        prefix = self.prefix_table[targets_np]                   # -1 where no prefix
+        ppos = pos[np.where(prefix < 0, V, prefix)]              # -1 where absent from the candidates
+        return (torch.from_numpy(cand).to(device="cuda", non_blocking=True),
+                torch.from_numpy(tpos).to(device="cuda", non_blocking=True),
+                torch.from_numpy(ppos).to(device="cuda", non_blocking=True))
+
+sns_builder = SampledSoftmaxCandidates(next_multiple_of_n(50257, n=128))
+for _p in sorted({sns_p_at(_s) for _s in range(training_schedule.total_steps + 1)} - {0}):
+    get_ce_kernel(_p)  # nvrtc compile at import (untimed)
+
+def sns_args(step: int, targets_np: np.ndarray):
+    P = sns_p_at(step)
+    return sns_builder.build(targets_np, P) if P else ()
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -2373,20 +2445,22 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
 warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
+sns_change_steps = [s for s in range(1, training_schedule.total_steps) if sns_p_at(s) != sns_p_at(s - 1)]
+warmup_steps = sorted(set(warmup_steps) | {s + offset for s in sns_change_steps for offset in [-1, 0]})
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
     for idx in range(training_manager.grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, targets_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         rows = gather_embedding_rows(model, inputs, bigram_inputs)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows, *sns_args(step, targets_cpu)).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
@@ -2415,7 +2489,9 @@ t0 = time.perf_counter()
 # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
 # (get_encoding is cached in tiktoken's registry), so this pays only the table construction.
 # In-place copy keeps the buffer's tensor identity, which the compiled graph holds.
-model.prefix_table.copy_(build_prefix_table(model.vocab_size))
+_prefix_table = build_prefix_table(model.vocab_size)
+model.prefix_table.copy_(_prefix_table)
+sns_builder.prefix_table = _prefix_table.numpy()
 # begin training
 train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
@@ -2435,7 +2511,7 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
@@ -2456,10 +2532,10 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(training_manager.grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, targets_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         rows = gather_embedding_rows(model, inputs, bigram_inputs)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows, *sns_args(step, targets_cpu)).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
