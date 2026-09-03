@@ -264,6 +264,12 @@ bench: stage1 388→361 ms, stage3 1230→1134 ms（−7〜8%、≈ −75 s）�
 ### Exp 18: PR #347 のパッケージ — c_proj 非ゼロ初期化 + lm_head/embed のみ TailEMA（2026-09-03）
 upstream PR #347（Muon スタックで 16 run ペア比較 −0.9%）: MLP c_proj を 0.5·d^-0.5 で初期化（現状ゼロ）、lm_head/embed の fp32 TailEMA（window ~300, blend 0.65）。Exp 11 の bank 平均化は外す（`TAIL_BANK_BLEND=0`, `TAIL_VE_BLEND=0`）。val が −0.003 以上改善すれば拡張 step を減らして時間に換える。
 
+**結果 (不採用)**: `logs/81497046-8c23-4a16-b802-b4ecc1d60154.txt` — train_time 1074.1 s、**val_loss 3.2816**（Exp 15 の 3.2782 より +0.0034、ノイズ超）。途中 val（step1000 3.450 vs 3.4455）はほぼ同じで最終だけ悪い → lm_head/embed の TailEMA blend が終盤の改善を鈍らせる（Exp 11 と同じ傾向）。c_proj 初期化の単独効果は不明だが、パッケージとしては却下。
+
+### Exp 19: グループ化 10 ソースの post-loop MUDD（PR #360）（2026-09-03）
+post-loop の残差混合を 5 ソース（cache[0], cache[7], cache[9], ve[1], cache[3]）のトークン別スカラー係数から、10 ソース（+ ve[2], ve[10], ve[8], 最終 MLP 入力の normed, norm(cache[7])）× 12 チャネルグループ別係数（ゼロ初期化の追加 einsum）に。PR #360 のアブレーションでは +6 millinats 相当。`MUDD_GROUPED=1`。
+
 **結果**: (実行中)
+
 
 
