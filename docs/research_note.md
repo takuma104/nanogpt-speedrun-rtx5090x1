@@ -11,7 +11,8 @@
 | 2026-09-03 | 1304.9 s | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
 | 2026-09-03 | 1210.5 s | 3.2763 | `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` | Exp 3: FP8 MLP backward (−7.2%) |
 | 2026-09-03 | 1093.3 s | 3.2789 | `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` | Exp 9: sampled softmax 訓練損失（PR #360 移植）+ 拡張 35 step (−9.8%) |
-| 2026-09-03 | **1086.4 s** | 3.2805 | `logs/5984bf8e-aa01-435e-b220-a93266662c89.txt` | Exp 12: Exp 9 の SNS_START=0（序盤 full softmax 無し）。val は 3.28 ちょうど（要マージン回復） |
+| 2026-09-03 | 1086.4 s | 3.2805 | `logs/5984bf8e-aa01-435e-b220-a93266662c89.txt` | Exp 12: Exp 9 の SNS_START=0（序盤 full softmax 無し）。val は 3.28 ちょうど |
+| 2026-09-03 | **1093.1 s** | 3.2766 | `logs/345def6d-2a4c-4067-be97-4e8658b42cf4.txt` | Exp 13: 部分的 log-Q 補正 (×0.5)。val にマージンが戻る（現在の記録構成） |
 
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
@@ -232,5 +233,11 @@ Exp 8→9 で序盤 100 step の full softmax は step 250 の val をほぼ改�
 
 ### Exp 13: 部分的 log-Q 補正（SNS_LOGQ_SCALE=0.5）（2026-09-03）
 完全補正（Exp 10）は途中 val を大きく改善したが負例の重み ×14 のノイズで最終 val が悪化。オフセットを半分（log 比 × 0.5 → 重み ×~3.7）にしてバイアスとノイズの中間を取る。構成は Exp 12 と同じ（SNS_START=0, 拡張 35）。
+
+**結果 (採用)**: `logs/345def6d-2a4c-4067-be97-4e8658b42cf4.txt` — **train_time 1093.1 s, val_loss 3.2766**。途中 val も大幅改善（step250 4.54 vs 4.70、step1000 3.446 vs 3.498、step1250 3.2980 vs 3.3022）で full softmax 系（平均 3.2772）と同水準に戻った。完全補正 (×1.0) の 3.2846 より良く、バイアスとノイズの中間が正解。時間は Exp 12 比 +7 s（offset ベクトルのホスト計算/転送 or ノイズ）。
+拡張 step の削減余地: 20 step ≈ 0.007（Exp 8→9）なので 10 step 削ると 3.280 前後になり不可。デフォルト `SNS_LOGQ_SCALE=0.5` でコミット。
+
+### Exp 14: Exp 13 構成の再実行（run 間ばらつき）（2026-09-03）
+記録構成（sampled softmax ×0.5 補正、拡張 35）が安定して 3.28 を下回るかの確認。
 
 **結果**: (実行中)

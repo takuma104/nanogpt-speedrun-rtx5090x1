@@ -1523,7 +1523,7 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig,
                 emb_rows: Tensor | None = None, ve_rows: Tensor | None = None, bigram_rows: Tensor | None = None,
-                sns_cand: Tensor | None = None, sns_tpos: Tensor | None = None, sns_ppos: Tensor | None = None):
+                sns_cand: Tensor | None = None, sns_tpos: Tensor | None = None, sns_ppos: Tensor | None = None, sns_off: Tensor | None = None):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -1735,7 +1735,7 @@ class GPT(nn.Module):
             if sns_cand is not None:
                 # Sampled (shared-negative) softmax over the micro-batch's candidate set; validation always
                 # uses the full vocabulary (the eval branch below).
-                loss_per_token = SampledSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), sns_tpos, mtp_weights, sns_ppos, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale, sns_cand)
+                loss_per_token = SampledSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), sns_tpos, mtp_weights, sns_ppos, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale, sns_cand, sns_off)
             else:
                 prefix_target_seq = self.prefix_table[target_seq]
                 loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
@@ -2095,6 +2095,7 @@ SNS_CANDIDATE_RAMP = {2: [int(v) for v in os.environ.get("SNS_P3_RAMP", "14336,1
 SNS_FULL_SOFTMAX_STEPS = int(os.environ.get("SNS_FULL_SOFTMAX_STEPS", 100))
 SNS_START = int(os.environ.get("SNS_START", 0))  # optional full-softmax head (did not help in Exp 8->9)
 SNS_STRIDE = 20011  # coprime with the vocab: k * stride mod V sweeps a permutation of the classes
+SNS_LOGQ_SCALE = float(os.environ.get("SNS_LOGQ_SCALE", 0.5))  # partial log-Q correction: 1.0 is unbiased but noisy (worse final loss), 0 is biased; 0.5 measured best
 
 def sns_p_at(step: int) -> int:
     """Candidate count for `step` (0 = full softmax)."""
@@ -2142,9 +2143,14 @@ class SampledSoftmaxCandidates:
         tpos = pos[targets_np]
         prefix = self.prefix_table[targets_np]                   # -1 where no prefix
         ppos = pos[np.where(prefix < 0, V, prefix)]              # -1 where absent from the candidates
+        # log-Q correction: the U target classes are always included (q = 1); each of the other V - U classes is
+        # a negative with probability (P - U) / (V - U), so its exp(logit) is up-weighted by (V - U) / (P - U).
+        off = np.full(P, SNS_LOGQ_SCALE * math.log((V - U) / max(1, P - U)), dtype=np.float32)  # 1.0 = unbiased, 0 = none
+        off[pos[targets_np]] = 0.0
         return (torch.from_numpy(cand).to(device="cuda", non_blocking=True),
                 torch.from_numpy(tpos).to(device="cuda", non_blocking=True),
-                torch.from_numpy(ppos).to(device="cuda", non_blocking=True))
+                torch.from_numpy(ppos).to(device="cuda", non_blocking=True),
+                torch.from_numpy(off).to(device="cuda", non_blocking=True))
 
 sns_builder = SampledSoftmaxCandidates(next_multiple_of_n(50257, n=128))
 for _p in sorted({sns_p_at(_s) for _s in range(training_schedule.total_steps + 1)} - {0}):

@@ -845,7 +845,7 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
     GEMMs run at P instead of the 50304-way vocabulary. The weight gradient is densified into the
     full (model_dim, vocab) layout with zeros for the non-candidate columns."""
     @staticmethod
-    def forward(ctx, x, target_pos, mtp_weights, prefix_pos, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, cand, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, target_pos, mtp_weights, prefix_pos, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, cand, col_offset, A=23.0, B=5.0, C=7.5):
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)                       # (T, D)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)          # (D, V) row-major
         w_rows = torch.empty((w_f8.shape[1], w_f8.shape[0]), dtype=w_f8.dtype, device=w_f8.device)
@@ -859,7 +859,7 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
         losses = torch.empty(n_rows, dtype=torch.float32, device=x.device)
         grad_input = torch.empty((n_rows, P), dtype=torch.float8_e5m2, device=x.device)
         prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
-        ce_fwd_bwd(logits, target_pos.contiguous(), mtp_weights.contiguous(), prefix_pos.contiguous(), prefix_weight,
+        ce_fwd_bwd(logits, target_pos.contiguous(), mtp_weights.contiguous(), prefix_pos.contiguous(), prefix_weight, col_offset.contiguous(),
                    losses, grad_input, n_rows, n_rows, n_predict, A, B, C, grad_s, grad_scale, P)
         ctx.save_for_backward(x_f8, wc, grad_input, cand)
         ctx.params = (x_s, w_s, grad_s, lm_head_weight.shape)
@@ -883,7 +883,7 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
         gw_c = torch._scaled_mm(x_f8_T, grad_input_T.T, out_dtype=torch.float32, scale_a=x_scale, scale_b=grad_scale, use_fast_accum=False)  # (D, P)
         grad_w = torch.zeros(w_shape, dtype=torch.float32, device=gw_c.device)
         grad_w.index_copy_(1, cand, gw_c)
-        return grad_x, None, None, None, None, grad_w, None, None, None, None, None
+        return grad_x, None, None, None, None, grad_w, None, None, None, None, None, None
 
 
 def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
@@ -1118,6 +1118,7 @@ __global__ void ce_fwd_bwd_kernel(
     const float* __restrict__ mtp_weights,
     const int64_t* __restrict__ prefix_targets,
     const float* __restrict__ prefix_weight_ptr,
+    const float* __restrict__ col_offset,   // per-class additive offset on the softcapped logit (sampled-softmax log-Q correction; all zero for the full vocabulary)
     float* __restrict__ losses,
     __nv_fp8_e5m2* grad_input,
     int batch_size,
@@ -1160,7 +1161,7 @@ __global__ void ce_fwd_bwd_kernel(
         float tmp = __bfloat162float(result[k]);
         tmp = sigmoid(tmp * inv_C + B_div_C);
         result_sigmoid[k] = __float2bfloat16(tmp);
-        tmp = A * tmp;
+        tmp = A * tmp + col_offset[idx + k];
         thread_max = max(tmp, thread_max);
       }
       *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
@@ -1196,10 +1197,9 @@ __global__ void ce_fwd_bwd_kernel(
     }
     #pragma unroll
     for (int k = 0; k < VEC_WIDTH; k++) {
-      float tmp = A * __bfloat162float(l[k]);
-      tmp = __expf(tmp - block_max);
       if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-        thread_sum += tmp;
+        float tmp = A * __bfloat162float(l[k]) + col_offset[idx + k];
+        thread_sum += __expf(tmp - block_max);
       }
     }
   }
@@ -1233,14 +1233,14 @@ __global__ void ce_fwd_bwd_kernel(
         float weight = mtp_weights[k];
         int64_t target = targets[target_idx];
         if (target >= 0 && target < VOCAB_SIZE) {
-          float z_target = A * __bfloat162float(smem[target]);
+          float z_target = A * __bfloat162float(smem[target]) + col_offset[target];
           total_loss += weight * (lse - z_target);
         }
       }
     }
     // Same CE logic as MTP, but the target is the prefix token T' at this position.
     if (prefix_valid) {
-      float z_target = A * __bfloat162float(smem[prefix_target]);
+      float z_target = A * __bfloat162float(smem[prefix_target]) + col_offset[prefix_target];
       total_loss += prefix_weight * (lse - z_target);
     }
     losses[blockIdx.x] = total_loss;
@@ -1264,7 +1264,7 @@ __global__ void ce_fwd_bwd_kernel(
       #pragma unroll
       for (int j = 0; j < VEC_WIDTH; j++) {
         float sigmoid_u = __bfloat162float(sigmoid_us[j]);
-        float z = A * sigmoid_u;
+        float z = A * sigmoid_u + col_offset[idx + j];
         float p = __expf(z - lse);
 
         float term1 = S_w * p;
@@ -1301,7 +1301,7 @@ __global__ void ce_fwd_bwd_kernel(
 
     if (valid) {
       float sigmoid_u = __bfloat162float(smem[target]);
-      float z = A * sigmoid_u;
+      float z = A * sigmoid_u + col_offset[target];
       float p = __expf(z - lse);
 
       float term1 = S_w * p;
@@ -1354,6 +1354,7 @@ def ce_fwd_bwd(
     mtp_weights: torch.Tensor,
     prefix_targets: torch.Tensor,
     prefix_weight: torch.Tensor,
+    col_offset: torch.Tensor,
     losses: torch.Tensor,
     grad_input: torch.Tensor,
     n_rows: int,
@@ -1374,7 +1375,7 @@ def ce_fwd_bwd(
     get_ce_kernel(vocab_size)(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
-        (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
+        (logits, targets, mtp_weights, prefix_targets, prefix_weight, col_offset, losses, grad_input,
          n_targets, n_predict, A, B, C, grad_s, grad_scale),
         shared_mem=vocab_size * 2,
     )
@@ -1413,6 +1414,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
 
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=x.device)
+        col_offset = torch.zeros(n_cols, dtype=torch.float32, device=x.device)
 
         for start in range(0, n_rows, CE_CHUNK_ROWS):
             end = min(start + CE_CHUNK_ROWS, n_rows)
@@ -1424,7 +1426,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
                 scale_b=w_scale,
                 use_fast_accum=True,
             )
-            ce_fwd_bwd(logits, targets[start:], mtp_weights, prefix_targets[start:], prefix_weight,
+            ce_fwd_bwd(logits, targets[start:], mtp_weights, prefix_targets[start:], prefix_weight, col_offset,
                        losses[start:end], grad_input[start:end],
                        end - start, n_rows - start, n_predict, A, B, C, grad_s, grad_scale, n_cols)
 
