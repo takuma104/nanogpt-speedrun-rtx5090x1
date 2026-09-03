@@ -267,9 +267,15 @@ upstream PR #347（Muon スタックで 16 run ペア比較 −0.9%）: MLP c_pr
 **結果 (不採用)**: `logs/81497046-8c23-4a16-b802-b4ecc1d60154.txt` — train_time 1074.1 s、**val_loss 3.2816**（Exp 15 の 3.2782 より +0.0034、ノイズ超）。途中 val（step1000 3.450 vs 3.4455）はほぼ同じで最終だけ悪い → lm_head/embed の TailEMA blend が終盤の改善を鈍らせる（Exp 11 と同じ傾向）。c_proj 初期化の単独効果は不明だが、パッケージとしては却下。
 
 ### Exp 19: グループ化 10 ソースの post-loop MUDD（PR #360）（2026-09-03）
-post-loop の残差混合を 5 ソース（cache[0], cache[7], cache[9], ve[1], cache[3]）のトークン別スカラー係数から、10 ソース（+ ve[2], ve[10], ve[8], 最終 MLP 入力の normed, norm(cache[7])）× 12 チャネルグループ別係数（ゼロ初期化の追加 einsum）に。PR #360 のアブレーションでは +6 millinats 相当。`MUDD_GROUPED=1`。
+post-loop の残差混合を 5 ソース（cache[0], cache[7], cache[9], ve[1], cache[3]）のトークン別スカラー係数から、10 ソース（+ ve[2], ve[10], ve[8], 最終 MLP 入力の normed, norm(cache[7])）× 12 チャネルグループ別係数（ゼロ初期化の追加 einsum）に。PR #360 のアブレーションでは +6 millinats 相当。`MUDD_GROUPED=1`。harness: 軌跡は初期状態で同一（ゼロ初期化）、step 時間 +1〜1.5%（ソース数 2 倍）。
+
+**結果 (不採用)**: `logs/c9aedb76-75af-406d-8812-dd1607673b59.txt` — train_time 1081.8 s、**val_loss 3.2806**（Exp 15 比 +0.0024、+7.5 s）。この環境（PR #360 の他の変更なし）では効果なし。→ 却下（`scratchpad/prof/patch_mudd_grouped.py`）。
+
+### Exp 20: stage 3 の文書長上限 2048→3072（2026-09-03）
+PR #360 は stage 3 で document cap 3072（attention は 2560 の virtual cap）を使う。ここでは `STAGE3_SEQ_LEN=3072`（sliding window は (5,11)×128 のまま、DC は固定 112 なので計算量はほぼ不変）。token 列は同じで packing だけ変わる。
 
 **結果**: (実行中)
+
 
 
 
