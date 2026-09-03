@@ -2093,7 +2093,7 @@ training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterati
 SNS_CANDIDATES_PER_STAGE = [int(os.environ.get("SNS_P12", 10240))] * 2 + [14336]
 SNS_CANDIDATE_RAMP = {2: [int(v) for v in os.environ.get("SNS_P3_RAMP", "14336,14336,24576").split(",")]}
 SNS_FULL_SOFTMAX_STEPS = int(os.environ.get("SNS_FULL_SOFTMAX_STEPS", 100))
-SNS_START = int(os.environ.get("SNS_START", 100))  # full softmax for the first steps (early learning suffers most from the bias)
+SNS_START = int(os.environ.get("SNS_START", 0))  # optional full-softmax head (did not help in Exp 8->9)
 SNS_STRIDE = 20011  # coprime with the vocab: k * stride mod V sweeps a permutation of the classes
 
 def sns_p_at(step: int) -> int:
@@ -2113,9 +2113,13 @@ class SampledSoftmaxCandidates:
         self.V = vocab_size
         self.mark = np.zeros(vocab_size, dtype=bool)
         self.pos = np.full(vocab_size + 1, -1, dtype=np.int64)   # pos[V] = -1: "no prefix"
-        self.perm = (np.arange(vocab_size, dtype=np.int64) * SNS_STRIDE) % vocab_size
+        perm = (np.arange(vocab_size, dtype=np.int64) * SNS_STRIDE) % vocab_size
+        self.perm = np.concatenate([perm, perm])  # doubled so a draw can wrap around the end of the sweep
         self.off = 0
         self.prefix_table = np.full(vocab_size, -1, dtype=np.int64)  # filled once the prefix table is built
+
+    def reset(self):
+        self.off = 0
 
     def build(self, targets_np: np.ndarray, P: int):
         mark, pos, V = self.mark, self.pos, self.V
@@ -2471,6 +2475,7 @@ print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
+sns_builder.reset()
 del val_loader, train_loader, initial_state
 model.quantize_mlp_fp8(bootstrap_down=True)
 model.train()

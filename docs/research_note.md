@@ -10,7 +10,8 @@
 | 2026-09-02 | 1429.8 s | 3.2779 | `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` | Exp 1: DC attention backward カーネル書き直し (−16.1%) |
 | 2026-09-03 | 1304.9 s | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
 | 2026-09-03 | 1210.5 s | 3.2763 | `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` | Exp 3: FP8 MLP backward (−7.2%) |
-| 2026-09-03 | **1093.3 s** | 3.2789 | `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` | Exp 9: sampled softmax 訓練損失（PR #360 移植）+ 拡張 35 step (−9.8%) |
+| 2026-09-03 | 1093.3 s | 3.2789 | `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` | Exp 9: sampled softmax 訓練損失（PR #360 移植）+ 拡張 35 step (−9.8%) |
+| 2026-09-03 | **1086.4 s** | 3.2805 | `logs/5984bf8e-aa01-435e-b220-a93266662c89.txt` | Exp 12: Exp 9 の SNS_START=0（序盤 full softmax 無し）。val は 3.28 ちょうど（要マージン回復） |
 
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
@@ -202,3 +203,34 @@ upstream の未マージ PR #360 (@devenpzak, "ANVIL2", 8xH100 で 73.9→39.9 s
 - 予測: train_time ≈ 1095 s、val_loss ≈ 3.277-3.280
 
 **結果 (採用)**: `logs/7802c421-1dca-47c1-816e-79e33fb0d9b2.txt` — **train_time 1093.3 s, val_loss 3.2789**（−9.8%、baseline 比 −35.8%）。3.28 は下回るがマージンは薄い（同構成ノイズ ±0.001）。途中 val は依然として悪い（step250 4.73, step1000 3.51 vs 3.42）→ 序盤 100 step の full softmax は効かず、sampled 期間中のバイアスが主因。`NUM_EXTENSION_ITERATIONS` のデフォルトを 35 に変更してコミット。
+
+#### codex による Exp 8 diff レビュー
+- 位置ベースの MTP 先読み・prefix 処理・grad_scale・P ごとの warmup・validation 経路に問題なし。
+- 指摘 1: stride 順列のスライスが末尾で wrap しない（負例の一部をスキップ；P は while ループで埋まるので結果は正しい）→ 順列を 2 倍長にして修正（次 run から）。
+- 指摘 2: warmup が `sns_builder.off` を進めるのでリセット後の開始オフセットが warmup 依存 → reset で 0 に戻す（次 run から）。
+- 指摘 3（既存の挙動）: lm_head.grad を fp32 で返しても param が bf16 なので autograd が bf16 に cast して累積している（upstream からそのまま）。
+
+### Exp 10: sampled softmax の log-Q 補正（2026-09-03）
+Exp 8/9 の sampled 期間中の val 悪化は、候補外クラスの logit に勾配が流れない系統的バイアスによる。古典的な sampled-softmax の補正: 負例（一様サンプル、採用確率 (P−U)/(V−U)）の exp(logit) を (V−U)/(P−U) 倍する = softcap 後の logit に log((V−U)/(P−U)) を加算（target クラスは常に候補なので 0）。CE カーネルに per-class offset ベクトルを追加（full softmax ではゼロ）。
+- 孤立テスト: 損失の期待値が full と一致（19.60 vs 19.78; 補正なし 16.87）。16 回の負例サンプルで平均した dx の相対誤差 0.027(1 回)→0.0069（→0 に収束 = 不偏）、補正なしは 0.012 で頭打ち（バイアス）。代償として 1 micro-batch あたりのノイズは増える（負例列の重み勾配が ×~14）。
+- 構成は Exp 9 と同一（SNS_START=100, 拡張 35 step）で補正の効果だけを見る。
+
+**結果 (不採用)**: `logs/f99740d6-1f22-4e57-89dc-54d303210ec0.txt` — train_time 1099.3 s、**val_loss 3.2846**（Exp 9 の 3.2789 より悪い）。途中 val はバイアス除去で大幅改善（step250 4.517 vs 4.727、step1000 3.447 vs 3.506、full softmax 参照 4.50 / 3.42 に近い）が、step1250 以降で逆転（3.3067 vs 3.3011）。負例の ×(V−U)/(P−U) 重みによる勾配ノイズ（特に lm_head 列）が終盤の精度に効いたと解釈。→ 補正は却下（コードは Exp 9 に戻す）。中庸（部分補正、大きい P）は今後の候補。
+
+### Exp 11: Exp 9 + 終盤 300 step の tail averaging（2026-09-03）
+PR #360 / #347 の "ships" の簡略版: 最後の 300 step の重みの fp32 EMA（lm_head/embed は Adam step ごと、bank/value_embeds は 4 step ごと）を、最終 validation 直前（クロック内）に重みへ blend（lm_head/embed 0.65、bank と value_embeds 0.5）。codex 指摘の 2 点（順列 wrap、warmup 後のオフセット reset）も反映。
+期待: 終盤の EMA で val −0.002〜0.005 → 拡張 step を減らす余地。
+
+- 1 回目 (`logs/5771bcf3-...`) は step 1005（tail 開始）で `KeyError: 'lm_head'`（compiled model の named_parameters は `_orig_mod.` 接頭辞付き; CPU テストは素のモジュールだった）→ param の `.label` で引くよう修正して再実行。
+
+**結果 (不採用)**: `logs/0535c2db-e6e8-43eb-a93a-c094ba017f6f.txt` — train_time 1093.8 s、**val_loss 3.2811**（Exp 9 の 3.2789 より +0.002）。step1250 までは Exp 9 と同じ軌跡（3.3007 vs 3.3011）なので ship 自体がわずかに悪化させた（LR 0.15 でまだ改善中の bank を 200 step 遅れの EMA と 0.5 で混ぜるのは早すぎる/重すぎる）。→ 却下（`scratchpad/prof/patch_tail_ships.py`）。PR #347 流の lm_head/embed のみ TailEMA（blend 0.65）は未検証。
+
+### Exp 12: Exp 9 構成（+ codex 修正）で SNS_START=0（2026-09-03）
+Exp 8→9 で序盤 100 step の full softmax は step 250 の val をほぼ改善しなかった（4.76→4.73）ので外す（−7 s）。同時に、記録構成の再現性（3.28 以下に安定して入るか、sampled 期の run 間ノイズ）を測る。
+
+**結果 (採用、ただしマージン無し)**: `logs/5984bf8e-aa01-435e-b220-a93266662c89.txt` — **train_time 1086.4 s, val_loss 3.2805**。軌跡は Exp 9 と同じ（step250 4.70 vs 4.73、step1250 3.3022 vs 3.3011）→ 序盤の full softmax は不要（−7 s）。最終 val は 3.2789 / 3.2805 の 2 run で、sampled 構成のノイズは full 構成と同程度（±0.001）だが 3.28 ぎりぎり。baseline 自体が 3.2805 だったので「3.28 程度」の範囲だが、次はバイアス低減でマージンを回復したい。
+
+### Exp 13: 部分的 log-Q 補正（SNS_LOGQ_SCALE=0.5）（2026-09-03）
+完全補正（Exp 10）は途中 val を大きく改善したが負例の重み ×14 のノイズで最終 val が悪化。オフセットを半分（log 比 × 0.5 → 重み ×~3.7）にしてバイアスとノイズの中間を取る。構成は Exp 12 と同じ（SNS_START=0, 拡張 35）。
+
+**結果**: (実行中)
