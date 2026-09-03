@@ -153,3 +153,23 @@ H100x8 では通信/MFU の都合で大バッチが有利だったが、1 GPU �
 
 ### 調査: FlexAttention vs flash-attn2（2026-09-03）
 varlen + sliding window + causal の block mask で比較（T=16k-32k, window 128-1408）: forward は同等、backward は Flex が ~50% 遅い（例 T=32768 W=896: FA2 1.65 ms vs Flex 2.40 ms fwd+bwd）。→ FA2 のまま。attention カーネルの選択肢は FA2 / FA4 / Flex を試して FA2 が最良。
+
+### 試作: e5m2 勾配の delayed scaling + fused 量子化カーネル（2026-09-03、不採用）
+amax パスを省くため、MLP backward の g / dpre の per-tensor scale を「前 micro-batch の amax × 2」に（buffer を backward 内で更新: torch.compile でも動作することを確認）。数値は動的 scale 版と同等（bf16 backward 比 rms 誤差 6-8%）だが、**速度は変わらず**（456 / 926 / 1417 ms vs 457 / 930 / 1421）。inductor は既に amax reduction を rms_norm backward 等に融合しており、残る FP8 overhead は K-major 転置の書き出しなど本質的なもの。→ 却下（`scratchpad/prof/patch_delayed_scaling.py`）。
+
+### 調査: inductor のチューニングオプション（2026-09-03）
+`TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1`, `TORCHINDUCTOR_MULTI_KERNEL=1`: fwd/bwd の時間は不変（428 / 1348 ms）。→ 不採用。（coordinate descent tuning は upstream で禁止されているので試していない）
+
+### 調査: lm_head/CE の行チャンク化で logits を L2 常駐に（2026-09-03、不採用）
+`CE_CHUNK_ROWS` = 1024 / 2048 / 4096: stage3 1482 / 1462 / 1435 ms（無チャンク 1421 ms）。小さい GEMM とループのオーバーヘッドが L2 効果を上回る。
+
+### Exp 6: attention 射影の forward のみ FP8（2026-09-03）
+Exp 4 の loss 悪化は e5m2 勾配が原因と推定し、QKV / O projection の **forward のみ** e4m3 (動的 per-tensor scale) にして backward は bf16 のまま（`FP8LinearFwdFunction`, `ATTN_FP8_FWD=1`）。MLP up-proj の forward FP8 は upstream でも採用済みなのでリスクは低いはず。
+bench: stage1 457→446 ms, stage3 1421→1388 ms（−2.3%）。12 step 損失 18.94→12.94（参照範囲）。
+
+**結果 (不採用)**: `logs/f54e7ab6-2fd0-4b00-830d-4803d9125aac.txt` — train_time 1183.1 s (−2.3%) だが **val_loss 3.2808**（Exp 3 の 3.2763 から +0.0045、step1250 でも +0.004 と一貫）。forward の e4m3 量子化だけでも attention 射影は loss に効く（MLP と違って v / attention 出力の誤差が直接残差に入るため?）。拡張 stage を ~10 step 増やせば相殺できるが正味 ~1% にしかならず、コードも増えるので **却下**。Exp 3 が引き続き最良。
+
+### Exp 7: 定数 grad_scale = world_size/8 の検証（= Exp 3 構成の再実行）（2026-09-03）
+codex レビュー P1 の対応（参照 8xH100 の勾配正規化と一致させ、`ForwardScheduleConfig.grad_scale` の配管を撤去）。optimizer は全てスケール不変なので結果は Exp 3 と同じはず。同時に、同一構成の再実行として run 間ばらつきの目安を得る。
+
+**結果**: (実行中)
