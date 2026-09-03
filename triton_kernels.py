@@ -1,4 +1,5 @@
 import functools
+import os
 import torch
 import triton
 import triton.language as tl
@@ -625,12 +626,14 @@ def linear_relu_square(
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128 if is_small_smem() else 256
+    BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 128 if use_fp8 else 64
 
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
+    FORWARD = aux is None
+    if is_small_smem():
+        # Tuned on RTX 5090 (99 KB smem): smaller tiles so that 3 pipeline stages fit.
+        BLOCK_SIZE_N, BLOCK_SIZE_K = (128, 64) if FORWARD else (64, 64)
+    if FORWARD:
         # Forward stores only `post` (into `c`); aux_desc is never accessed on the
         # forward path. Use a SEPARATE minimal [BM, BN//2] dummy (NOT `c`) so the two
         # TMA descriptors don't alias the same buffer (aliasing can perturb the
@@ -1227,6 +1230,7 @@ def ce_fwd_bwd(
     losses: torch.Tensor,
     grad_input: torch.Tensor,
     n_rows: int,
+    n_targets: int,
     n_predict: int,
     A: float,
     B: float,
@@ -1234,14 +1238,21 @@ def ce_fwd_bwd(
     grad_s: float,
     grad_scale: float,
 ) -> None:
+    # n_rows: rows (logits / losses / grad_input) handled by this launch; n_targets: number of valid
+    # entries in `targets`, which may extend past n_rows so the multi-token-prediction lookahead of
+    # the last rows of a row chunk still sees the following targets.
     grid = (n_rows, 1, 1)
     ce_fwd_bwd_kernel(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
         (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
-         n_rows, n_predict, A, B, C, grad_s, grad_scale),
+         n_targets, n_predict, A, B, C, grad_s, grad_scale),
         shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
     )
+
+# Optionally process the (rows, vocab) logits / gradient in row chunks (CE_CHUNK_ROWS=16384 saves ~1.5 GB
+# at 32k-token micro-batches at a ~0.5% step-time cost). Off by default: a single chunk.
+CE_CHUNK_ROWS = int(os.environ.get("CE_CHUNK_ROWS", 1 << 30))
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
@@ -1251,51 +1262,54 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
 
         w_f8_col_major = w_f8.T.contiguous().T
+        x_scale = x.new_tensor(x_s, dtype=torch.float32)
+        w_scale = x.new_tensor(w_s, dtype=torch.float32)
 
-        logits = torch._scaled_mm(
-            x_f8,
-            w_f8_col_major,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-
-        n_rows, n_cols = logits.shape
+        n_rows, n_cols = x.shape[0], lm_head_weight.shape[1]
         if mtp_weights is None:
-             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+             mtp_weights = torch.tensor([1.0], device=x.device, dtype=torch.float32)
         n_predict = mtp_weights.shape[0]
 
-        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
-        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        losses = torch.empty(n_rows, dtype=torch.float32, device=x.device)
 
-        logits = logits.contiguous()
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
 
         if prefix_targets is None:
-            prefix_targets = torch.full((n_rows,), -1, dtype=torch.int64, device=logits.device)
+            prefix_targets = torch.full((n_rows,), -1, dtype=torch.int64, device=x.device)
         prefix_targets = prefix_targets.contiguous()
 
         if prefix_weight is None:
-            prefix_weight = torch.zeros(1, dtype=torch.float32, device=logits.device)
+            prefix_weight = torch.zeros(1, dtype=torch.float32, device=x.device)
         prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=x.device)
 
-        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
-             n_rows, n_predict, A, B, C, grad_s, grad_scale)
+        for start in range(0, n_rows, CE_CHUNK_ROWS):
+            end = min(start + CE_CHUNK_ROWS, n_rows)
+            logits = torch._scaled_mm(
+                x_f8[start:end],
+                w_f8_col_major,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scale,
+                scale_b=w_scale,
+                use_fast_accum=True,
+            )
+            ce_fwd_bwd(logits, targets[start:], mtp_weights, prefix_targets[start:], prefix_weight,
+                       losses[start:end], grad_input[start:end],
+                       end - start, n_rows - start, n_predict, A, B, C, grad_s, grad_scale)
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
+        # Only the fp8 operands are needed for backward; in particular the (rows, vocab) bf16 logits
+        # must not be kept alive (they dominate peak memory at large micro-batches).
+        ctx.save_for_backward(x_f8, w_f8, grad_input)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
+        x_f8, w_f8, grad_input = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
-        n_rows, n_cols = logits.shape
-        n_predict = mtp_weights.shape[0]
+        n_rows, n_cols = grad_input.shape
 
         grad_output = grad_output.contiguous()
 
@@ -1312,19 +1326,23 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
-        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+        grad_w = None
+        for start in range(0, n_rows, CE_CHUNK_ROWS):
+            end = min(start + CE_CHUNK_ROWS, n_rows)
+            x_f8_T = torch.empty((x_f8.shape[1], end - start), dtype=x_f8.dtype, device=x_f8.device)
+            transpose_copy(x_f8[start:end], x_f8_T)  # (768, rows) row-major
 
-        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
-        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+            grad_input_T = torch.empty((n_cols, end - start), dtype=grad_input.dtype, device=grad_input.device)
+            transpose_copy(grad_input[start:end], grad_input_T)  # (50304, rows) row-major
 
-        grad_w = torch._scaled_mm(
-            x_f8_T,            # (768, n_rows) row-major
-            grad_input_T.T,    # (n_rows, 50304) column-major view
-            out_dtype=torch.float32,
-            scale_a=x_scale,
-            scale_b=grad_scale,
-            use_fast_accum=False,
-        )
+            grad_w_chunk = torch._scaled_mm(
+                x_f8_T,            # (768, rows) row-major
+                grad_input_T.T,    # (rows, 50304) column-major view
+                out_dtype=torch.float32,
+                scale_a=x_scale,
+                scale_b=grad_scale,
+                use_fast_accum=False,
+            )
+            grad_w = grad_w_chunk if grad_w is None else grad_w.add_(grad_w_chunk)
 
-        return grad_x, None, None, None, None, grad_w, None, None, None
+        return grad_x, None, None, None, None, grad_w, None, None, None, None

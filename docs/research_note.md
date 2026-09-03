@@ -7,7 +7,8 @@
 | 日付 | train_time | val_loss | log | 変更 |
 |---|---|---|---|---|
 | 2026-09-02 | 1703.7 s | 3.2805 | `logs/c0f0c03b-9c5b-489a-a163-c4fff78b2518.txt` | baseline (H100x8 コードをそのまま RTX5090x1 で実行) |
-| 2026-09-02 | **1429.8 s** | 3.2779 | `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` | Exp 1: DC attention backward カーネル書き直し (−16.1%) |
+| 2026-09-02 | 1429.8 s | 3.2779 | `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` | Exp 1: DC attention backward カーネル書き直し (−16.1%) |
+| 2026-09-03 | **1304.9 s** | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
 
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
@@ -59,3 +60,44 @@ fp32 リファレンスとの誤差: q/w1/w2 grad は同等、k/v grad は改善
 **結果**: `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` — **train_time 1429.8 s, val_loss 3.2779**（baseline 1703.7 s / 3.2805）。−16.1%。途中の val_loss も baseline と一致（step250: 4.4988 vs 4.5053, step1000: 3.4163 vs 3.4190）。ピークメモリ 23.9 GB（変化なし）。
 
 codex による差分レビュー: 実バグなし（window>113 の pre-existing な制限を指摘、window=112 なので無関係）。NaN 安全のため `a_hidden` の valid マスクを復元して commit。
+
+### Exp 2: 純粋な速度改善 4 点セット（2026-09-02）
+Exp 1 の上に、数式を変えない 4 つの変更をまとめて検証（それぞれ bench harness で個別に効果確認済み）:
+
+1. **Embedding 勾配の行単位累積** (`gather_embedding_rows` / `accumulate_embedding_grads`):
+   autograd の embedding backward は micro-batch ごとに dense な (vocab, dim) 勾配を生成（zero-fill + scatter）し、さらに `.grad` へ全サイズの add をしていた。value_embeds (5x50304x768) + bigram_embed (377280x768) + embed で ~1 GB/micro-batch の無駄なメモリトラフィック。
+   行を compiled graph の外で gather して leaf tensor として渡し、(tokens, dim) の行勾配を `index_add_` で `.grad` に足すように変更。
+   マイクロベンチ: dense path ~1.5-2 ms/table vs index_add_ 0.03-0.2 ms。
+2. **stage ごとの micro-batch 数** (`MAX_MICRO_BATCH_TOKENS=32768` → grad_accum 8/8/16):
+   H100x8 の per-GPU micro-batch (16384/32768 tokens) を stage 1-2 で再現。stage 3 (49152 tokens) は OOM するので 16 のまま。
+   `grad_scale`（loss スケールと lm_head の FP8 grad scale）を `ForwardScheduleConfig` 経由で stage ごとに渡す。
+   bench: stage1 620→549 ms, stage2 1112→1052 ms（この項目単体）。
+3. **fused MLP Triton カーネルのタイル設定** (99 KB smem 向け): backward `dpre` は従来 num_stages=1 で動いていた（0.335 ms @T=8192）。BM=128/BN=64/BK=64/3 stages で 0.251 ms（cuBLAS bf16 + epilogue 0.252 ms と同等、T=24576 では 0.715 vs 0.807 で Triton が勝ち）。forward は BK=64/3 stages で ~3% 改善。
+4. `FusedSoftcappedCrossEntropy` が backward 用に (rows, vocab) の bf16 logits を保存していたのをやめる（backward では shape しか使っていなかった）。stage 3 の 8 micro-batch 化には足りず OOM のまま。ついでに backward の返り値数（10 入力に対し 9）を修正。
+
+**bench (3 step 平均)**: stage1 620→504 ms, stage2 1112→991 ms, stage3 1631→1529 ms（Exp1 比 −19% / −11% / −6%）。ピーク 21.5 GB。
+予測 train_time ≈ 1300 s。
+
+**結果 (失敗)**: 1 回目 (`logs/ca7f77f0-...`) は warmup 中に OOM（warmup 用の model/optimizer state スナップショット ~6 GB が GPU 上にあったため。CPU に置くよう修正）。
+2 回目 `logs/949b06dc-dbee-43d4-bc5e-9c5d0a80d124.txt`: train_time 1288 s だが **val_loss が step 250 以降 NaN**。
+原因: 3. のタイル設定の編集で `aux = torch.empty(...)`（forward 用ダミー）が `if aux is None:` ブロックの外に出てしまい、backward の `dpre` カーネルの `aux`（= `post`）が未初期化バッファに置き換わっていた（step 1 で NaN）。bench harness は損失を表示していなかったので気付けなかった → harness に LOSS 表示を追加、実験前に必ず 10 step 程度の損失を確認する運用に変更。
+
+**教訓**: 速度だけでなく損失の有限性・軌跡を短い run で必ず確認する。
+
+### Exp 2b: Exp 2 の修正版 + micro-batch 4/8/12 + chunked CE（2026-09-02）
+- aux バグ修正
+- micro-batch 数の "8 の倍数" 制約を撤廃（codex の指摘）: 32768 tokens/micro-batch で 4/8/12 に
+- `FusedSoftcappedCrossEntropy` を 16384 行ずつのチャンク処理に（(rows, vocab) bf16 logits と fp8 勾配の転置を全サイズで持たない）。MTP の先読みはチャンク境界を跨げるよう `n_targets` を別引数に
+
+### 調査: FlashAttention-4 (CuTe DSL, sm_120 カーネル) vs hub flash-attn2（2026-09-02）
+`flash-attn-4==4.0.0b29` + `nvidia-cutlass-dsl 4.6.2` を別 venv に入れて varlen + causal + sliding window を比較。
+T=32768, maxdoc=896: FA2 fwd 0.242 / fwd+bwd 1.385 ms vs FA4 fwd 0.333 / fwd+bwd 1.440 ms（FA4 の方が遅い）。
+maxdoc=2048 の設定では FA4 が `cudaErrorIllegalAddress` でクラッシュ。→ **不採用**（FA4 の SM120 backward は SM80 世代 MMA ベースで smem 99 KB 制約、codex の予想通り）。
+- 結果として採用した構成: micro-batch 4/8/12 (32768 tokens)、CE chunking はデフォルト off（`CE_CHUNK_ROWS` 環境変数で有効化可能）。
+  - stage 3 を 8x49152 にすると chunked CE 込みで 1517 ms（−1%）だが reserved 26.8 GB + 非 torch ~4.4 GB でほぼ限界 → 不採用
+  - 12x32768 と 16x24576 は同等（1532 vs 1529 ms）。harness のノイズは ±1.5% 程度
+- bench: stage1 494 ms, stage2 1004 ms, stage3 1532 ms → 予測 train_time ≈ 1306 s
+- 事前チェック: 12 step の損失 18.94 → 12.91（参照と一致、finite）
+
+**結果**: `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` — **train_time 1304.9 s, val_loss 3.2772**（Exp1 比 −8.7%、baseline 比 −23.4%）。途中 val_loss も一致（step250 4.4966, step1000 3.4167）。ピーク 21.5 GB。
+（1 回目の起動は cwd ミスで `./run.sh` が見つからず GPU が 15 分遊んだ — 起動は絶対パスで）

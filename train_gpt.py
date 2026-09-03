@@ -61,6 +61,17 @@ _gpu_mem_gb = torch.cuda.get_device_properties(int(os.environ.get("LOCAL_RANK", 
 grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", (8 // world_size) * (1 if _gpu_mem_gb >= 48 else 2)))
 assert grad_accum_steps % (8 // world_size) == 0, "grad_accum_steps must be a multiple of 8 // world_size"
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
+# Training micro-batches: the reference setup runs one 1/8-batch micro-batch per GPU (grad_accum_steps = 8 // world_size).
+# On smaller GPUs, use the largest training micro-batch that fits instead (at most MAX_MICRO_BATCH_TOKENS tokens),
+# per training stage (see TrainingManager.advance_schedule). The optimizer math only depends on the effective batch.
+# Validation keeps using grad_accum_steps.
+MAX_MICRO_BATCH_TOKENS = int(os.environ.get("MAX_MICRO_BATCH_TOKENS", 32768 if _gpu_mem_gb < 48 else 1 << 40))
+def get_train_grad_accum_steps(batch_size: int) -> int:
+    steps = max(8 // world_size if MAX_MICRO_BATCH_TOKENS >= (1 << 40) else 1,
+                math.ceil(batch_size / (world_size * MAX_MICRO_BATCH_TOKENS)))
+    while batch_size % (world_size * steps * 128) != 0:  # micro-batches must tile the batch (in 128-token units)
+        steps += 1
+    return steps
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1222,6 +1233,7 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+    grad_scale: float
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1501,7 +1513,8 @@ class GPT(nn.Module):
             bigram_gates[layer] = gate[..., offset + 1:offset + 2]
         return gate[..., 28:29]
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig,
+                emb_rows: Tensor | None = None, ve_rows: Tensor | None = None, bigram_rows: Tensor | None = None):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -1546,17 +1559,20 @@ class GPT(nn.Module):
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
         # ---- Embeddings and input preparation ----
-        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        # embed is synced from lm_head during tied phase by optimizer.
+        # During training the embedding rows are gathered outside the compiled graph (see gather_embedding_rows).
+        x = self.embed(input_seq) if emb_rows is None else emb_rows
         
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
         sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
         bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
-        x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
+        bigram_embed = self.bigram_embed(bigram_input_seq) if bigram_rows is None else bigram_rows
+        x0_bigram = (bigram_embed * bigram_signs)[None]                                     # (1, seq, bigram_dim)
 
         # Value embeddings - always computed (not precomputed)
-        ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
+        ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq] if ve_rows is None else ve_rows
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
         ve = [None, ve[0], ve[1], *self.gate_filler_nones, ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
@@ -1702,7 +1718,8 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            grad_scale = schedule_cfg.grad_scale  # 1 / (training micro-batches per step), per stage
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, grad_scale * 0.75 / 448, grad_scale)
         else:
             # Materializing the full (tokens, vocab) logits at the validation batch size needs ~25 GiB (bf16)
             # + ~50 GiB (fp32), fine on 80 GB H100s but not on 32 GB consumer GPUs (e.g. RTX 5090).
@@ -1716,6 +1733,37 @@ class GPT(nn.Module):
                 losses.append(F.cross_entropy(logits.float(), target_seq[i:i + chunk_size], reduction="none"))
             loss_per_token = torch.cat(losses)
         return loss_per_token
+
+# -----------------------------------------------------------------------------
+# Embedding-row gradient accumulation (single-GPU, many micro-batches)
+#
+# With autograd's default embedding backward, every micro-batch materializes a dense
+# (vocab, dim) gradient (zero-fill + scatter) which is then added into .grad (another
+# full-size read/write). For value_embeds (5 x 50304 x 768) + bigram_embed + embed that is
+# ~1 GB of gradient traffic per micro-batch. Gathering the rows outside the compiled graph
+# as leaf tensors gives (tokens, dim) row gradients instead, which are index_add_'ed into
+# the persistent .grad buffer. The math is unchanged.
+
+def gather_embedding_rows(model, inputs: Tensor, bigram_inputs: Tensor):
+    with torch.no_grad():
+        emb_rows = model.embed.weight[inputs]
+        ve_rows = model.value_embeds.view(5, model.vocab_size, -1)[:, inputs]
+        bigram_rows = model.bigram_embed.weight[bigram_inputs]
+    return emb_rows.requires_grad_(), ve_rows.requires_grad_(), bigram_rows.requires_grad_()
+
+def accumulate_embedding_grads(model, inputs: Tensor, bigram_inputs: Tensor, rows):
+    emb_rows, ve_rows, bigram_rows = rows
+    with torch.no_grad():
+        for param, idx, rows_grad in ((model.embed.weight, inputs, emb_rows.grad),
+                                      (model.value_embeds, inputs, ve_rows.grad),
+                                      (model.bigram_embed.weight, bigram_inputs, bigram_rows.grad)):
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            if param is model.value_embeds:  # (5, tokens, dim) rows -> flattened (5 * vocab, dim) gradient
+                idx = (idx.view(1, -1) + model.vocab_size * torch.arange(5, device=idx.device, dtype=idx.dtype).view(-1, 1)).reshape(-1)
+                rows_grad = rows_grad.reshape(-1, rows_grad.shape[-1])
+            param.grad.index_add_(0, idx, rows_grad)
+
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -2123,7 +2171,8 @@ class TrainingManager():
             prefix_weight = self.prefix_weight,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
-            train_max_seq_len = self.train_max_seq_len
+            train_max_seq_len = self.train_max_seq_len,
+            grad_scale = self.grad_scale,
         )
 
     def _is_adam_step(self, step: int):
@@ -2143,7 +2192,9 @@ class TrainingManager():
         new_batch_size = stage.batch_size
         new_train_max_seq_len = stage.train_max_seq_len
         if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
-            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
+            self.grad_accum_steps = get_train_grad_accum_steps(new_batch_size)
+            self.grad_scale = 1 / self.grad_accum_steps
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, self.grad_accum_steps)
             self.batch_size = new_batch_size
             self.train_max_seq_len = new_train_max_seq_len
         else:
@@ -2182,6 +2233,8 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.grad_accum_steps = get_train_grad_accum_steps(stage.batch_size)
+        self.grad_scale = 1 / self.grad_accum_steps
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -2191,8 +2244,17 @@ class TrainingManager():
             self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
 
 
-    def get_state(self):
-        return copy.deepcopy(self.optimizer.state_dict())
+    def get_state(self, device=None):
+        state = self.optimizer.state_dict()
+        if device is None:
+            return copy.deepcopy(state)
+        # Snapshot to another device (e.g. CPU) without a transient GPU copy
+        return {
+            "param_states": {pid: {k: (v.to(device, copy=True) if isinstance(v, torch.Tensor) else copy.deepcopy(v))
+                                   for k, v in p_state.items()}
+                             for pid, p_state in state["param_states"].items()},
+            "param_cfgs": copy.deepcopy(state["param_cfgs"]),
+        }
 
     def sparse_index_update(self, step, bigram_indexes):
         if not _sparse_comms_active():
@@ -2291,9 +2353,11 @@ training_manager = TrainingManager(model)
 ########################################
 print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+# Save the initial state. The snapshot lives on the CPU: on a 32 GB GPU the optimizer-state copy (~5 GB)
+# would otherwise push the warmup steps (which run the largest micro-batches) out of memory.
+initial_state = dict(model={k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()},
+                     optimizer=training_manager.get_state(device="cpu"))
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=training_manager.grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
@@ -2307,14 +2371,16 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
-    for idx in range(grad_accum_steps):
+    for idx in range(training_manager.grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        rows = gather_embedding_rows(model, inputs, bigram_inputs)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * training_manager.grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
-        del loss
+        accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
+        del loss, rows
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8(bootstrap_down=True)
 print0("Resetting Model", console=True)
@@ -2328,7 +2394,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=training_manager.grad_accum_steps)
 
 gc.collect()
 
@@ -2379,13 +2445,15 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for idx in range(grad_accum_steps):
+    for idx in range(training_manager.grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        rows = gather_embedding_rows(model, inputs, bigram_inputs)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), *rows).sum() * training_manager.grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
-        del loss
+        accumulate_embedding_grads(model, inputs, bigram_inputs, rows)
+        del loss, rows
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8(bootstrap_down=(step < 16))
 
