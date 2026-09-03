@@ -8,7 +8,8 @@
 |---|---|---|---|---|
 | 2026-09-02 | 1703.7 s | 3.2805 | `logs/c0f0c03b-9c5b-489a-a163-c4fff78b2518.txt` | baseline (H100x8 コードをそのまま RTX5090x1 で実行) |
 | 2026-09-02 | 1429.8 s | 3.2779 | `logs/9e0fc6e7-a0de-4a99-a7dc-454fcea70fd6.txt` | Exp 1: DC attention backward カーネル書き直し (−16.1%) |
-| 2026-09-03 | **1304.9 s** | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
+| 2026-09-03 | 1304.9 s | 3.2772 | `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` | Exp 2b: embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 (−8.7%) |
+| 2026-09-03 | **1210.5 s** | 3.2763 | `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` | Exp 3: FP8 MLP backward (−7.2%) |
 
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
@@ -101,3 +102,23 @@ maxdoc=2048 の設定では FA4 が `cudaErrorIllegalAddress` でクラッシュ
 
 **結果**: `logs/f87cde40-8371-4e6a-bdad-25918515eb75.txt` — **train_time 1304.9 s, val_loss 3.2772**（Exp1 比 −8.7%、baseline 比 −23.4%）。途中 val_loss も一致（step250 4.4966, step1000 3.4167）。ピーク 21.5 GB。
 （1 回目の起動は cwd ミスで `./run.sh` が見つからず GPU が 15 分遊んだ — 起動は絶対パスで）
+
+#### codex による Exp 2b diff レビュー（2026-09-03）
+- P1: `grad_scale = 1/grad_accum_steps` だと loss が token 和なので、stage ごとに勾配の大きさが 4x/2x/1.33x 変わる（旧 5090 port の 1/16 も H100x8 参照の実効 1/8 と 2x ずれていた）。Muon (polar express) / Adam / cautious WD はすべてスケール不変なので結果は変わらない（Exp 2b の loss も正常）が、stage 境界で Adam の 2-step 累積・momentum が一時的に歪む。→ 参照と完全に一致する定数 `grad_scale = world_size / 8` に変更予定（`ForwardScheduleConfig.grad_scale` の配管も不要になる）。
+- P2: micro-batch 数を変えると境界（bigram hash の先頭、MTP 先読みの打ち切り）が変わる → データ境界の効果で、少ない方がむしろ良い。問題なし。
+- 他（embedding 行 offset、tied embed/lm_head、odd-step Adam、CPU snapshot、CE chunk）は問題なしとの評価。
+
+### Exp 3: FP8 MLP backward（2026-09-03）
+Exp 2b 後のプロファイル: bf16 GEMM (cuBLAS) が step 時間の 37%（うち約半分が MLP backward の dW2/dW1/dx）、fp8 GEMM 16%、inductor elementwise 15%、fused MLP 13%、flash-attn 7-10%。
+**変更** (`FusedLinearReLUSquareFunction.backward`, `MLP_FP8_BWD=1` がデフォルト):
+- dW2 = post^T g, dpre_pre = g W2^T, dW1 = dpre^T x, dx = dpre W1 の 4 GEMM をすべて cuBLAS FP8 (`_scaled_mm`) に。gradient (g, dpre) は e5m2、activation (x, post) と weight は e4m3、per-tensor の動的スケール（lm_head backward と同じ流儀）
+- W1^T / W2 の row-major fp8 コピーを `quantize_mlp_fp8` で step ごとに用意（cuBLAS FP8 は A row-major / B column-major のみ）
+- 保存する activation は bf16 のまま（x, post）で backward 内で再量子化。forward の delayed-scaling スケール（in-place 更新される buffer）を backward で使うと、torch.compile の partitioner が backward 側で「更新後の buffer から clone を再計算」してしまい dW2 が 30x 狂う（compile でのみ再現）。
+- fp32→fp8 の cast は compile 下では saturate しない（448 をわずかに超える値が NaN）→ cast 前に clamp
+- e5m2 の範囲チェック: max 57344
+
+**孤立テスト**: fp32 参照との rms 相対誤差 dx/dW1/dW2 = 9.1% / 9.1% / 7.3%（bf16 backward: 3.8% / 3.8% / 4.4%。どちらも forward の fp8 量子化誤差を含む）
+**bench**: stage1 497→457 ms, stage2 1004→930 ms, stage3 1532→1421 ms（−7〜8%）。12 step 損失 18.94→12.91（参照と一致）。予測 train_time ≈ 1210 s。
+**リスク**: e5m2 勾配による最終 loss の悪化。
+
+**結果**: `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` — **train_time 1210.5 s, val_loss 3.2763**（Exp 2b 比 −7.2%、baseline 比 −29.0%）。loss は悪化せず（途中 val: step250 4.5300（他 run より +0.03 だが）, step750 3.6822, step1000 3.4146 と後半はむしろ良い）。ピーク 21.6 GB。

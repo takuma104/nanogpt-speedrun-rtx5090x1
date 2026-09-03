@@ -667,42 +667,42 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=0,
         )
-        g20 += g
+        g20 += g.to(tl.float32)
         da, g = _dc_bwd_pre_dm_head(
             V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=1,
         )
-        da_acc += da
-        g21 += g
+        da_acc += da.to(tl.float32)
+        g21 += g.to(tl.float32)
         da, g = _dc_bwd_pre_dm_head(
             V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=2,
         )
-        da_acc += da
-        g22 += g
+        da_acc += da.to(tl.float32)
+        g22 += g.to(tl.float32)
         da, g = _dc_bwd_pre_dm_head(
             V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=3,
         )
-        da_acc += da
-        g23 += g
+        da_acc += da.to(tl.float32)
+        g23 += g.to(tl.float32)
         da, g = _dc_bwd_pre_dm_head(
             V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=4,
         )
-        da_acc += da
-        g24 += g
+        da_acc += da.to(tl.float32)
+        g24 += g.to(tl.float32)
         da, g = _dc_bwd_pre_dm_head(
             V, DO, POST_W2, DV, a_hidden, q_offs, k_offs, d_offs, q_mask,
             stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
             stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d, T=T, H=5,
         )
-        da_acc += da
-        g25 += g
+        da_acc += da.to(tl.float32)
+        g25 += g.to(tl.float32)
 
         tl.store(
             DA_BUF + q_offs[:, None].to(tl.int64) * stride_at + rel.to(tl.int64) * stride_aw,
@@ -710,18 +710,18 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
             mask=valid,
         )
 
-        sd0 += tl.sum(w10[:, None] * da_acc * p0, axis=1)
-        g10 += tl.sum(da_acc * p0, axis=1)
-        sd1 += tl.sum(w11[:, None] * da_acc * p1, axis=1)
-        g11 += tl.sum(da_acc * p1, axis=1)
-        sd2 += tl.sum(w12[:, None] * da_acc * p2, axis=1)
-        g12 += tl.sum(da_acc * p2, axis=1)
-        sd3 += tl.sum(w13[:, None] * da_acc * p3, axis=1)
-        g13 += tl.sum(da_acc * p3, axis=1)
-        sd4 += tl.sum(w14[:, None] * da_acc * p4, axis=1)
-        g14 += tl.sum(da_acc * p4, axis=1)
-        sd5 += tl.sum(w15[:, None] * da_acc * p5, axis=1)
-        g15 += tl.sum(da_acc * p5, axis=1)
+        sd0 += tl.sum(w10[:, None] * da_acc * p0, axis=1).to(tl.float32)
+        g10 += tl.sum(da_acc * p0, axis=1).to(tl.float32)
+        sd1 += tl.sum(w11[:, None] * da_acc * p1, axis=1).to(tl.float32)
+        g11 += tl.sum(da_acc * p1, axis=1).to(tl.float32)
+        sd2 += tl.sum(w12[:, None] * da_acc * p2, axis=1).to(tl.float32)
+        g12 += tl.sum(da_acc * p2, axis=1).to(tl.float32)
+        sd3 += tl.sum(w13[:, None] * da_acc * p3, axis=1).to(tl.float32)
+        g13 += tl.sum(da_acc * p3, axis=1).to(tl.float32)
+        sd4 += tl.sum(w14[:, None] * da_acc * p4, axis=1).to(tl.float32)
+        g14 += tl.sum(da_acc * p4, axis=1).to(tl.float32)
+        sd5 += tl.sum(w15[:, None] * da_acc * p5, axis=1).to(tl.float32)
+        g15 += tl.sum(da_acc * p5, axis=1).to(tl.float32)
 
     q64 = q_offs.to(tl.int64)
     tl.store(SOFT_DOT + q64 * stride_sdt + 0 * stride_sdh, sd0, mask=q_mask)

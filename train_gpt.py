@@ -1445,6 +1445,10 @@ class GPT(nn.Module):
                     device=self.mlp_bank.device,
                 )
                 self._mlp_down_proj_f8 = self._mlp_down_proj_f8_storage.transpose(1, 2)
+                # Row-major FP8 copies of W1^T (model_dim, hidden_dim) and W2 (hidden_dim, model_dim) for the
+                # FP8 backward (cuBLAS FP8 GEMMs need a row-major A and a column-major B operand).
+                self._mlp_up_proj_f8_t = torch.empty(12, model_dim, hidden_dim, dtype=torch.float8_e4m3fn, device=self.mlp_bank.device)
+                self._mlp_down_proj_f8_rm = torch.empty(12, hidden_dim, model_dim, dtype=torch.float8_e4m3fn, device=self.mlp_bank.device)
 
             up_weights = self.mlp_bank[:, 0]
             up_scales = up_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
@@ -1462,6 +1466,8 @@ class GPT(nn.Module):
                 self._mlp_down_proj_scales,
                 self._mlp_down_weight_partial_amax,
             )
+            self._mlp_up_proj_f8_t.copy_(self._mlp_up_proj_f8.transpose(1, 2))
+            self._mlp_down_proj_f8_rm.copy_(self._mlp_down_proj_f8_storage.transpose(1, 2))
 
     def init_mudd_gate(self, model_dim: int):
         self._mudd_gate_scale = nn.Parameter(torch.tensor(0.1))
@@ -1532,6 +1538,8 @@ class GPT(nn.Module):
             mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
             mlp_down_proj_f8 = self._mlp_down_proj_f8.unbind(0)
             mlp_down_proj_scales = [self._mlp_down_proj_scales[i:i+1] for i in range(12)]
+            mlp_up_proj_f8_t = self._mlp_up_proj_f8_t.unbind(0)
+            mlp_down_proj_f8_rm = self._mlp_down_proj_f8_rm.unbind(0)
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1689,6 +1697,10 @@ class GPT(nn.Module):
                     down_proj_scale,
                     self._mlp_down_act_scales[i:i+1],
                     self._mlp_down_partial_amax[i],
+                    (amax / 448.0).reshape(1).float(),  # x scale for the FP8 backward
+                    up_proj_scale,
+                    mlp_up_proj_f8_t[i],
+                    mlp_down_proj_f8_rm[i],
                 )
             else:
                 mlp_args = (c_fc, c_proj)

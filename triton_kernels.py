@@ -705,6 +705,19 @@ def linear_relu_square(
         return c, post_fp8
     return c
 
+# FP8 MLP backward (single-GPU speedrun): the three bf16 gradient GEMMs (dW2, dW1, dx) and the
+# grad @ W2^T GEMM of dpre run in FP8 (e4m3 activations/weights already produced by the forward,
+# e5m2 gradients with dynamic per-tensor scaling, like the lm_head backward).
+MLP_FP8_BACKWARD = bool(int(os.environ.get("MLP_FP8_BWD", "1")))
+E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+E5M2_MAX = float(torch.finfo(torch.float8_e5m2).max)
+
+def _to_e4m3(t):  # clamp first: the compiled fp32->fp8 cast does not saturate (overflow -> NaN/inf)
+    return t.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+
+def _to_e5m2(t):
+    return t.clamp(-E5M2_MAX, E5M2_MAX).to(torch.float8_e5m2)
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -719,6 +732,10 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         W2_scale=None,
         activation_scale=None,
         partial_amax=None,
+        x_scale=None,
+        W1_scale=None,
+        W1_f8_t=None,
+        W2_f8_rm=None,
     ):
         # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
         x_flat = x.view((-1, x.shape[-1]))
@@ -754,20 +771,68 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             )
         else:
             x3 = post @ W2
-        # Backward stays BF16: it consumes `post` (and W2), not their FP8 copies.
-        ctx.save_for_backward(x, W1, W2, post)
+        ctx.fp8_bwd = MLP_FP8_BACKWARD and W2_f8 is not None and W1_f8_t is not None and W2_f8_rm is not None
+        ctx.x_shape = tuple(x.shape)
+        if ctx.fp8_bwd:
+            # Activations are re-quantized in the backward from the saved bf16 tensors with their own
+            # per-tensor scales: the forward's activation scales live in buffers that are updated in place
+            # (delayed scaling), and under torch.compile a saved copy of them can be recomputed in the
+            # backward from the already-updated buffer. The weight scales are constant within a step.
+            ctx.save_for_backward(x_flat, post, W1_f8_t, W2_f8_rm, W1_scale, W2_scale)
+        else:
+            # Backward stays BF16: it consumes `post` (and W2), not their FP8 copies.
+            ctx.save_for_backward(x, W1, W2, post)
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
-        # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
-        # avoiding the redundant `pre` HBM read/write entirely.
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
-        dW1 = dpre.T @ x
-        dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None
+        if not ctx.fp8_bwd:
+            x, W1, W2, post = ctx.saved_tensors
+            dW2 = post.T @ grad_output
+            # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
+            # avoiding the redundant `pre` HBM read/write entirely.
+            dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
+            dW1 = dpre.T @ x
+            dx = dpre @ W1
+            return (dx.view(x.shape), dW1, dW2) + (None,) * 11
+
+        x, post, W1_f8_t, W2_f8_rm, W1_scale, W2_scale = ctx.saved_tensors
+        g = grad_output.reshape(-1, grad_output.shape[-1])
+        g_scale = (g.float().abs().amax() / E5M2_MAX).clamp_min(1e-30).reshape(1)
+        g_f8 = _to_e5m2(g.float() / g_scale)                                     # (T, D)
+        post_scale = (post.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
+        post_f8_T = _to_e4m3(post.T.float() / post_scale).contiguous()           # (Hd, T) row-major
+        # dW2 (Hd, D) = post^T @ g
+        dW2 = torch._scaled_mm(
+            post_f8_T,
+            g_f8.T.contiguous().T,         # (T, D) column-major
+            out_dtype=torch.bfloat16, scale_a=post_scale, scale_b=g_scale, use_fast_accum=False,
+        )
+        # dpre = 2 * (g @ W2^T) * relu(pre), with relu(pre) = sqrt(post)
+        gp = torch._scaled_mm(
+            g_f8,                          # (T, D) row-major
+            W2_f8_rm.T,                    # (D, Hd) column-major view of the row-major (Hd, D) copy
+            out_dtype=torch.bfloat16, scale_a=g_scale, scale_b=W2_scale, use_fast_accum=False,
+        )
+        dpre = 2.0 * gp.float() * post.float().sqrt()
+        d_scale = (dpre.abs().amax() / E5M2_MAX).clamp_min(1e-30).reshape(1)
+        dpre_f8 = _to_e5m2(dpre / d_scale)                                        # (T, Hd) row-major
+        dpre_f8_T = _to_e5m2(dpre.T / d_scale).contiguous()                       # (Hd, T) row-major
+        x_scale = (x.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
+        x_f8_cm = _to_e4m3(x.T.float() / x_scale).contiguous().T                  # (T, D) column-major
+        # dW1 (Hd, D) = dpre^T @ x
+        dW1 = torch._scaled_mm(
+            dpre_f8_T,
+            x_f8_cm,
+            out_dtype=torch.bfloat16, scale_a=d_scale, scale_b=x_scale, use_fast_accum=False,
+        )
+        # dx (T, D) = dpre @ W1
+        dx = torch._scaled_mm(
+            dpre_f8,                       # (T, Hd) row-major
+            W1_f8_t.T,                     # (Hd, D) column-major view of the row-major (D, Hd) copy
+            out_dtype=torch.bfloat16, scale_a=d_scale, scale_b=W1_scale, use_fast_accum=False,
+        )
+        return (dx.view(ctx.x_shape), dW1, dW2) + (None,) * 11
 
 
 def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
@@ -1214,7 +1279,7 @@ __global__ void ce_fwd_bwd_kernel(
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="90",
+    compute_capability="".join(map(str, torch.cuda.get_device_capability())),  # native SASS for the current GPU
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
