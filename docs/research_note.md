@@ -248,3 +248,22 @@ Exp 13/14 の余裕 ~0.003 を使う 3 つの小さな削減を同時に: stage 
 
 **結果 (採用)**: `logs/ec707ab7-0811-477e-a038-5fbba6b381d7.txt` — **train_time 1074.3 s, val_loss 3.2782**（−19 s、val は記録系の分布内 3.2766/3.2777/3.2782）。デフォルトに反映してコミット。残りマージン ~0.002 なのでこれ以上の削減は不可。
 
+
+### Exp 16: 深さ削減 — layer 7 を丸ごと除去（10 層）（2026-09-03）
+PR #360 は layer 7 除去 + attention 副層 2 つ除去 + 幅縮小のパッケージを合計 ~7 millinats の代償で入れている（wall −12%）。この環境では「layer 7（hub の次の層）除去」だけを試す。
+実装は `DROP_LAYER7=1` で `num_layers=10`、層インデックス依存の構造（hub = last−3 の cache、paired layers、xsa/dc/attn-gate 層、MUDD post-gate のレイアウト（41→33 係数）、注入層、bm_sizes、value-embedding の配置）をすべて `num_layers` から導出。11 層では従来と同一（harness で軌跡一致を確認）。
+bench: stage1 388→361 ms, stage3 1230→1134 ms（−7〜8%、≈ −75 s）。loss の代償が ~0.005 以下なら拡張 step で回収して正味 −5% 以上。
+
+**結果**: `logs/fef82d5b-8395-4474-8f94-55672752c23d.txt` — train_time 985.2 s（−89 s）だが **val_loss 3.2908**（+0.013）。終盤の交換レート（~0.0004/step, ~1.2 s/step）なら 40〜50 step（~50 s）で回収できる見込み → 正味 −4% 程度の可能性。次で確認。
+
+### Exp 17: 10 層 + スケジュール延長（scheduled 1270→1310, 拡張 30→40）（2026-09-03）
++50 step（≈ +50 s）で 0.013 を回収できるか。合計 1350 step、予測 ≈ 1035 s。
+
+**結果 (不採用)**: `logs/fa1b8ce0-fcfc-4e2a-b4b1-9f05d81e6d9f.txt` — train_time 1027.2 s、**val_loss 3.2861**。+50 step で回収できたのは 0.005 のみ（交換レートの見積もりが甘かった: 10 層モデルは step あたりの改善も小さい）。残り 0.006 の回収には +60 step 以上（+60 s）必要で 11 層の記録（1074 s）と変わらない → **深さ削減は却下**。コードは 11 層版（HEAD）に戻す（派生インデックス版は `scratchpad/prof/train_gpt_droplayer.py` / `patch_drop_layer.py`）。
+
+### Exp 18: PR #347 のパッケージ — c_proj 非ゼロ初期化 + lm_head/embed のみ TailEMA（2026-09-03）
+upstream PR #347（Muon スタックで 16 run ペア比較 −0.9%）: MLP c_proj を 0.5·d^-0.5 で初期化（現状ゼロ）、lm_head/embed の fp32 TailEMA（window ~300, blend 0.65）。Exp 11 の bank 平均化は外す（`TAIL_BANK_BLEND=0`, `TAIL_VE_BLEND=0`）。val が −0.003 以上改善すれば拡張 step を減らして時間に換える。
+
+**結果**: (実行中)
+
+
