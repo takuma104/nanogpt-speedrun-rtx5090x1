@@ -122,3 +122,25 @@ Exp 2b 後のプロファイル: bf16 GEMM (cuBLAS) が step 時間の 37%（う
 **リスク**: e5m2 勾配による最終 loss の悪化。
 
 **結果**: `logs/a8e283c2-215d-4e87-a39a-5d92422e9784.txt` — **train_time 1210.5 s, val_loss 3.2763**（Exp 2b 比 −7.2%、baseline 比 −29.0%）。loss は悪化せず（途中 val: step250 4.5300（他 run より +0.03 だが）, step750 3.6822, step1000 3.4146 と後半はむしろ良い）。ピーク 21.6 GB。
+
+### 調査: torch 2.11.0+cu130 (cuDNN 9.19, triton 3.6)（2026-09-03）
+別 venv で同じコードを bench: stage1 451 ms / stage2 915 ms / stage3 1486 ms（2.10+cu128: 452 / 920 / 1409）。fwd+bwd は同等、optimizer step が 25→113 ms に悪化（stage3 のみ）。→ **見送り**。
+なお CE カーネルの `_compile_kernel(compute_capability="90")` は cu130 では動かない（PTX JIT 不可）ので実 GPU の SM 向けにコンパイルするよう変更済み。DC カーネルの loop-carried 変数も新しい Triton では fp64 に昇格してコンパイル失敗するため明示 cast を追加。
+
+### Exp 4: FP8 attention projections + 定数 grad_scale（2026-09-03）
+- attention の QKV / O projection (fwd+bwd) を FP8 化（`FP8LinearFunction`、MLP backward と同じ流儀: e4m3 activation/weight, e5m2 grad, 動的 per-tensor scale, cast 前 clamp）。eval では bf16 のまま（val の計算は不変）。
+- `grad_scale = world_size / 8`（codex レビュー P1: 参照 8xH100 の正規化と一致させ、stage ごとに変わらないように）。`ForwardScheduleConfig.grad_scale` の配管を撤去。
+- プロファイル: bf16 GEMM はほぼ消え fp8 GEMM 587 ms/step（~450 TFLOPS、ほぼ roofline）。ただし fp8 の量子化/転置/amax パス（inductor 生成）が ~220 ms/step（stage3 の 16%）あり、attention FP8 の正味は −2%（452→448 / 920→910 / 1409→1394 ms）。
+- 試作: 「量子化 + row-major/転置 同時出力」の fused Triton カーネル（`scratchpad/prof/fp8_quant2d.py`）— inductor が既に同等の融合をしていたため効果なし（1%）。tl.trans + 2 出力の組合せで miscompile する罠あり。簡潔さ優先で不採用（delayed scaling で amax パスを省けば +3% 程度の見込みだが状態管理が増えるので保留）。
+- 見つけた torch.compile の罠: forward で in-place 更新される buffer から作った clone/slice を backward 用に保存すると、partitioner が backward 側で「更新後の buffer から再計算」してしまう。compile 内での `_used.copy_(buf)` も functionalization で alias になるので、スナップショットは compile の外で取る必要がある。
+- 12 step 損失 18.94→12.90（参照一致）。bench: 448 / 910 / 1394 ms（予測 ≈ 1190 s）。
+
+**結果 (不採用)**: `logs/f0446be1-7567-49d2-a049-aba22987d08f.txt` — train_time 1194.9 s だが **val_loss 3.2837**（Exp 3 の 3.2763 から +0.0074、目標 3.28 を超過）。step1250 でも 3.3002 vs 3.2928 と一貫して悪い。attention 射影の e5m2 勾配（QK/VO bank は Muon）が効いていると判断。時間 −1.3% に対し loss 悪化は ~30 step 分（+3%）→ **attention FP8 は却下**、コードは Exp 3 に戻す。
+（定数 grad_scale は理論上スケール不変で無害のはずだが、この run に同居させたため単独での検証はできていない。Exp 3 の per-stage 版を維持。）
+
+### 計画: Exp 5 — stage 3 のグローバルバッチを 24→16 (x2048x8) に（single-GPU 向けスケジュール実験）
+H100x8 では通信/MFU の都合で大バッチが有利だったが、1 GPU では micro-batch サイズ (32768 tokens) が変わらないため、stage 3 の
+バッチを小さくして optimizer step を増やしても step あたりのコストはほぼ比例（overhead ~1.5%）。token 効率が上がれば勝ち。
+- 実装 (`STAGE3_BATCH_UNITS=16`): stage 3 を 634 step + 拡張 22 step（token 数 338.56M ≈ 参照 338.82M）、lr_mul = 1.73·sqrt(16/24) = 1.41
+- LR の cooldown と Muon momentum cooldown は「累積 token」で参照スケジュール（バッチ 24）に写像（CPU で検証: lr-decay の差 1e-16、momentum 差 0.002）
+- 判定: 同 token で val_loss が有意に下がれば（≦3.270 程度）、token 数を削って train_time を縮める Exp 6 へ
