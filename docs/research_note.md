@@ -144,3 +144,12 @@ H100x8 では通信/MFU の都合で大バッチが有利だったが、1 GPU �
 - 実装 (`STAGE3_BATCH_UNITS=16`): stage 3 を 634 step + 拡張 22 step（token 数 338.56M ≈ 参照 338.82M）、lr_mul = 1.73·sqrt(16/24) = 1.41
 - LR の cooldown と Muon momentum cooldown は「累積 token」で参照スケジュール（バッチ 24）に写像（CPU で検証: lr-decay の差 1e-16、momentum 差 0.002）
 - 判定: 同 token で val_loss が有意に下がれば（≦3.270 程度）、token 数を削って train_time を縮める Exp 6 へ
+- bench: stage3 976 ms/step (8 micro-batch) × 634 step ≈ 619 s vs 1421 ms × 424 ≈ 602 s（同 token で +2.8%、optimizer step の固定費 ~25-45 ms が効く）
+
+- 1 回目の起動 (`logs/7964745c-...`) は拡張 stage の lr_mul が 1.41 のまま（参照は 1.0 → 最後の 22 step の LR が 0.212 vs 0.15）だったので 5 分で中断して修正・再起動。
+
+**結果 (不採用)**: `logs/51b47d7a-5be7-4bb0-bc2e-71de254c9a48.txt` — **val_loss 3.2772, train_time 1213.3 s**（Exp 3: 3.2763 / 1210.5 s）。同 token で loss は同じ（ノイズ範囲）、時間は +0.2%。stage 3 のバッチを小さくしても token 効率は上がらない（この loss 帯では 393k tokens のバッチはまだ critical batch size 以下ということ）→ **却下**、スケジュールコードは戻す（`scratchpad/prof/patch_stage3_batch.py` に保存）。
+途中経過: step1000 3.4524（参照は 3.4146 だが token 位置が違う: 1000 step = 206.7M tokens vs 参照の 1000 step = 231M）。
+
+### 調査: FlexAttention vs flash-attn2（2026-09-03）
+varlen + sliding window + causal の block mask で比較（T=16k-32k, window 128-1408）: forward は同等、backward は Flex が ~50% 遅い（例 T=32768 W=896: FA2 1.65 ms vs Flex 2.40 ms fwd+bwd）。→ FA2 のまま。attention カーネルの選択肢は FA2 / FA4 / Flex を試して FA2 が最良。
