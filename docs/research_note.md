@@ -39,6 +39,33 @@ stage1 (131k tokens/step, 16 micro-batch) の内訳（GPU時間）:
 
 cuBLAS 実測ピーク: bf16 200-227 TFLOPS, fp8 400-450 TFLOPS。
 
+
+## まとめ（2026-09-03 終了時点）
+
+![val_loss vs train_time](train_time_vs_val_loss.png)
+
+左: 全 full run の val_loss（250 step ごと）を train_time に対してプロット（実線 = 採用、破線 = 不採用）。右: 各 run の最終点（番号 = 実験番号、灰線 = 採用系列の推移）。
+
+**結果**: baseline 1703.7 s → **記録 1093.1 s（val_loss 3.2766 / 3.2777、2 run）、−35.8%**。validation の計算・データは baseline と同一。
+
+**効いたもの（時間順）**
+| 変更 | train_time | 種別 |
+|---|---|---|
+| DC attention backward Triton カーネル書き直し（レジスタスピル解消） | 1703.7 → 1429.8 s | カーネル |
+| embedding 行勾配 + micro-batch 4/8/12 + MLP カーネル設定 | → 1304.9 s | メモリ帯域 / 起動回数 |
+| FP8 MLP backward（e5m2 勾配・動的スケール） | → 1210.5 s | 精度/GEMM |
+| sampled softmax 訓練損失（PR #360 移植）+ 部分的 log-Q 補正 ×0.5 + 拡張 step | → 1093.1 s | アルゴリズム（lm_head コスト） |
+
+**効かなかった / 却下**: FP8 attention 射影（fwd+bwd, fwd のみ）、FA4 / FlexAttention、fused 量子化カーネル・delayed scaling（inductor が既に融合済み）、torch 2.11、inductor autotune、CE 行チャンク、stage 3 バッチ 16、完全 log-Q 補正、tail averaging / TailEMA、10 層化、grouped MUDD、stage 3 文書長 3072、高頻度トークンの常時候補化、記録構成の追加削減（再現せず）。
+
+**得られた知見**
+- RTX 5090 では GPU が飽和しており、cuBLAS bf16/fp8 GEMM は roofline 付近。H100 向け Triton カーネルはレジスタスピルで壊滅的に遅くなることがある（`n_spills` を必ず確認）。
+- torch.compile の落とし穴: forward で in-place 更新される buffer から派生した保存値は backward で再計算される（スナップショットは compile の外で）、fp32→fp8 cast は saturate しない、`tl.trans` + 二重 store の miscompile。
+- sampled softmax は wall を −13% にするが訓練勾配にバイアスがあり、完全補正は分散で逆効果、半分の補正が最良。最終 val のノイズは ~0.001 なので、3.28 に対し 0.002 以内の構成は再実行で確認が必要（Exp 15 は再現せず）。
+- upstream の未マージ PR は良いアイデア源だが、8xH100 前提の要素（巨大 n-gram 表、patched FA3）は 1 GPU 32 GB に移植不可。
+
+**再現手順**: `./run.sh`（デフォルトが記録構成）。ログは `logs/<uuid>.txt`。グラフの再生成: `python docs/plot_runs.py`（matplotlib が必要）。
+
 ## 実験ログ
 
 ### Exp 1: DC attention backward カーネルの書き直し（2026-09-02）
@@ -282,9 +309,11 @@ Exp 15 の構成は 1 run（3.2782）のみでマージンが薄いので、再�
 **結果**: `logs/bdc85e88-f969-42e4-9eb9-9f64df4041ea.txt` — train_time 1074.0 s、**val_loss 3.2829**（3.28 超）。Exp 15 の 3.2782 は幸運な引きだった（2 run 平均 3.2806）。→ デフォルトを Exp 13 の構成（P ランプあり、full 尾 100、拡張 35）に戻す。記録は **1093.1 s（val 3.2766 / 3.2777）**。
 
 ### Exp 22: 高頻度トークンを常に候補集合に含める（2026-09-03）
-sampled softmax のバイアスは「候補外の高確率トークンの logit が押し下げられない」ことから来る。unigram 頻度上位 K（K=2048、最初の train shard の頻度）を常に候補に入れれば欠落する確率質量が減る。log-Q 補正は「常に含まれる集合」(targets ∪ top-K) を q=1、残りの負例を (V−U')/(P−U') で重み付け。`SNS_TOPK=2048`。val が −0.003 以上改善すれば Exp 15 の削減を再試行。
+sampled softmax のバイアスは「候補外の高確率トークンの logit が押し下げられない」ことから来る。unigram 頻度上位 K（K=2048、最初の train shard の頻度）を常に候補に入れれば欠落する確率質量が減る。log-Q 補正は「常に含まれる集合」(targets ∪ top-K) を q=1、残りの負例を (V−U')/(P−U') で重み付け。`SNS_TOPK=2048`。val が −0.003 以上改善すれば Exp 15 の削減を再試行。harness: 序盤の損失がわずかに良い（step7 13.05 vs 13.26）。
 
-**結果**: (実行中)
+**結果 (不採用)**: `logs/35d44dad-32df-4503-aad7-86b3f9bafe75.txt` — train_time 1092.9 s、**val_loss 3.2792**（記録構成の 3.2766 / 3.2777 に対し改善なし、ノイズ範囲内でやや悪い）。→ 却下。
+
+（ユーザーの指示によりここで実験を終了。）
 
 
 
