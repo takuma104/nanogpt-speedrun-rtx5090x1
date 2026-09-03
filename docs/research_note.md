@@ -274,7 +274,13 @@ post-loop の残差混合を 5 ソース（cache[0], cache[7], cache[9], ve[1], 
 ### Exp 20: stage 3 の文書長上限 2048→3072（2026-09-03）
 PR #360 は stage 3 で document cap 3072（attention は 2560 の virtual cap）を使う。ここでは `STAGE3_SEQ_LEN=3072`（sliding window は (5,11)×128 のまま、DC は固定 112 なので計算量はほぼ不変）。token 列は同じで packing だけ変わる。
 
+**結果 (不採用)**: `logs/ea261356-22e7-4fb8-bc5f-d5075ba0d11c.txt` — train_time 1076.5 s、**val_loss 3.2832**（+0.005）。長い文書の packing は不利（短い文書を多く見る方が良い?）→ 却下。
+
+### Exp 21: 記録構成（Exp 15）の再実行（2026-09-03）
+Exp 15 の構成は 1 run（3.2782）のみでマージンが薄いので、再現性確認。3.28 を超えるようなら Exp 13 の構成（拡張 35, full 尾 100; 1093 s）に戻す。
+
 **結果**: (実行中)
+
 
 
 
