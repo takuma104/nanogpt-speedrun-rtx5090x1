@@ -20,6 +20,7 @@
 | 実験 | train_time | val_loss | log | 判定 |
 |---|---|---|---|---|
 | Exp 23 | **1098.226 s** | **3.2776** | `logs/35a971e8-9670-4592-b1ec-76b5eacd68f6.txt` | 旧記録構成の無変更再測定。新マシンでの基準値 |
+| Exp 24 | 1100.853 s | 3.2759 | `logs/ed7ee42e-3f9b-4894-89fd-56ada99f1f33.txt` | bigram 表 2 倍。loss は微改善、時間は +0.24% のため記録構成には不採用 |
 
 旧マシンの 1093.124 s に対して +0.47%。以後の改善率は上の新マシン基準に対して計算する。
 
@@ -360,4 +361,14 @@ sampled softmax のバイアスは「候補外の高確率トークンの logit 
 
 **事前確認**: `logs/53f59597-6e83-4949-ac4a-6cbaaf3d6f4b.txt`。序盤 10 step の損失 18.3334→13.4581（finite）。stage 0 / 847 / 1205 の平均時間は 389.1 / 1228.8 / 1436.9 ms、最大 allocated 24,901.7 MiB。full softmax を含め OOM なし。これらは短い診断の値であり、full run の時間とは直接比較しない。
 
-**full run 実行中**: `env BIGRAM_VOCAB_SIZE=754560 ./run.sh`、`logs/ed7ee42e-3f9b-4894-89fd-56ada99f1f33.txt`。まず学習 step 数を維持して精度への効果を測る。採用候補となる精度改善が得られた場合に、別 run で step 数を減らして train_time を評価する。
+**結果（記録構成には不採用）**: `env BIGRAM_VOCAB_SIZE=754560 ./run.sh`、`logs/ed7ee42e-3f9b-4894-89fd-56ada99f1f33.txt`。**train_time 1100.853 s、val_loss 3.2759**。基準比 +2.627 s（+0.24%）、loss −0.0017。最大 allocated 24,901 MiB / reserved 25,970 MiB（allocated は基準比 +3,316 MiB）。
+
+途中 val_loss: step 250 = 4.5647、500 = 4.1968、750 = 3.7190、1000 = 3.4433、1250 = 3.2976。序盤は基準より悪く、終盤で約 0.001〜0.002 改善。容量拡大のコストは小さいが、1 run の小さな loss 差だけでは確実な step 削減を主張できない。まず計算量を減らす別案を優先する。既定の bigram 行数は 377280 のまま。将来、他の速度改善の精度回復に組み合わせる候補にはなる。
+
+次案の準備（未適用・GPU 未検証）: `logs/anvil_trial.patch`。PR #360 の optimizer 要素（速い/遅い momentum、6 段 spectral map、slow momentum の符号による weight decay）を `ANVIL_OPTIMIZER=1` で試す小さな差分。terminal averaging は含めない。参照との差は、既存の直接 Frobenius norm 計算を維持することと、二つの momentum の混合開始を scheduled steps の 40% にすること。17 hunk が現在のコードに一意に適用でき、適用後の構文が有効であることのみ確認済み。
+
+### Exp 25: MLP 中間幅 3072→2560
+
+`MLP_HIDDEN_DIM=2560`、他は Exp 23 と同じ（bigram 表は元の 377280 行）。11 層と residual 幅 768 を維持し、各 MLP の行列積を約 1/6 減らす。中間幅に応じて量子化用 partial-amax buffer のタイル数を導出する配管は `8b4e765` に追加済み。
+
+`env MLP_HIDDEN_DIM=2560 BENCH_STAGES=0,847,1205 .venv/bin/torchrun --standalone --nproc_per_node=1 docs/bench_train.py` で事前確認中。
