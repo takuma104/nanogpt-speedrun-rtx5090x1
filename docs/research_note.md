@@ -15,6 +15,14 @@
 | 2026-09-03 | **1093.1 s** | 3.2766 / 3.2777 | `logs/345def6d-2a4c-4067-be97-4e8658b42cf4.txt`, `logs/07c71c90-dbb3-4316-86c5-a8ae01260f6c.txt` | Exp 13/14: 部分的 log-Q 補正 (×0.5)。**現在の記録構成**（2 run とも 3.28 未満、baseline 比 −35.8%） |
 | 2026-09-03 | (1074.3 s) | 3.2782 / 3.2829 | `logs/ec707ab7-...`, `logs/bdc85e88-...` | Exp 15/21: P ランプ無し + full 尾 60 + 拡張 30 — 再実行で 3.28 超のため**記録として不採用** |
 
+### 2026-09-05 再開後（新マシン上で比較）
+
+| 実験 | train_time | val_loss | log | 判定 |
+|---|---|---|---|---|
+| Exp 23 | **1098.226 s** | **3.2776** | `logs/35a971e8-9670-4592-b1ec-76b5eacd68f6.txt` | 旧記録構成の無変更再測定。新マシンでの基準値 |
+
+旧マシンの 1093.124 s に対して +0.47%。以後の改善率は上の新マシン基準に対して計算する。
+
 ## 環境
 - RTX 5090 (170 SM, 32 GB, 99 KB smem/block), driver 610.57, torch 2.10.0+cu128, triton 3.6.0, cuDNN 9.10
 - FlashAttention-3 は sm_120 非対応 → `kernels-community/flash-attn2` にフォールバック
@@ -315,8 +323,41 @@ sampled softmax のバイアスは「候補外の高確率トークンの logit 
 
 （ユーザーの指示によりここで実験を終了。）
 
+## 再開（2026-09-05、別マシンの RTX 5090 x1）
 
+- 再開時のコード: `c78a30f`（Exp 13/14 の記録構成、working tree clean）。最初の実行はコード・ハイパーパラメータを変更せず `./run.sh`。
+- 新マシン: Intel Core Ultra 9 285（24 CPU）、RTX 5090 32 GB、電力上限 575 W、driver 610.57.04、Python 3.14、torch 2.10.0+cu128、Triton 3.6.0。旧マシンの記録ログは Python 3.13.12。
+- `data/cached_fineweb10B.py 9` で従来と同じ公開トークン化済みデータ（検証 shard と学習先頭 9 shard）を取得。validation の計算・データを維持する。
+- 新旧マシン間の絶対時間差を改善として数えず、新マシン上の再測定値を基準として比較する。
+- 停止条件: ユーザーの指示により、理論的限界に達したと判断できる場合は停止可能。ただし、局所的な失敗や GEMM の飽和だけを研究全体の限界とはみなさない。
 
+### Exp 23: 現在の記録構成を新マシンで再測定
 
+**結果: train_time 1098.226 s、val_loss 3.2776**。`logs/35a971e8-9670-4592-b1ec-76b5eacd68f6.txt`。旧マシンの Exp 13/14（3.2766 / 3.2777）と同程度の loss を再現。時間は Exp 13 より 5.102 s（+0.47%）長い。ピークメモリ allocated 21,585 MiB / reserved 22,530 MiB は旧記録と一致。
 
+途中 val_loss: step 250 = 4.5429、500 = 4.1731、750 = 3.7202、1000 = 3.4445、1250 = 3.2992。GPU は本学習中に使用率 100%、消費電力約 575 W、SM clock 2760 MHz（1 回のサンプル、固定 clock ではない）。
 
+起動時に未配置だったデータと FlashAttention のキャッシュを取得。サンドボックス内では GPU と uv キャッシュにアクセスできないため、許可済みのサンドボックス外実行を使用。
+
+検証ファイル `fineweb_val_000000.bin` の SHA-256: `5b95c8e0966f0861685b307b23dc5ae42b228ef74b28cb499784ae021f201640`。
+
+再開後の診断・実験候補（まだ結果ではない）:
+- `docs/bench_train.py`: 本体の setup を再利用する短い stage benchmark。10 回の損失有限性確認後に測定。`BENCH_PROFILE=nsys` で限定区間だけ CPU/GPU timeline を採取できる。重みを warmup 後に戻さない診断なので、記録としては扱わない。
+- MLP 中間幅 3072→2560: 11 層は維持し、MLP の計算量を約 1/6 減らす。量子化用 partial-amax buffer のタイル数も形状から導出する必要がある。短い測定で速度と損失の有限性を確認してから full run で判定。
+- bigram 表の小規模な拡張（377,280→754,560 行）: 巨大な upstream の表とは別に、残り VRAM 内で hash 衝突を減らす案。追加の行列積はないが、重み・Adam 状態・勾配のメモリと更新時間は増えるので実測する。全重みはゼロから時間内に学習。
+- [upstream PR #360](https://github.com/KellerJordan/modded-nanogpt/pull/360) の optimizer 本体（速い/遅い二つの momentum、spectral map、weight decay）の要素は未検証。過去の tail averaging 実験と区別して検討。参照コミットは `c924f68e4d72e80307fc27a7bb3a55cfb6ad43c7`。
+- FP4 は未測定。[Transformer Engine の公式 NVFP4 対応表](https://nvidia.github.io/TransformerEngine/features/low_precision_training/nvfp4/nvfp4.html) では学習対応が SM 10.0/10.3 に限定されており、SM 12.0 では個別の kernel 実装・検証が必要。これは既成実装の制限であり、速度の理論的限界を示すものではない。
+
+#### 診断実行の中断と復旧
+
+`nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --env-var=BENCH_PROFILE=nsys,BENCH_STAGES=0 --output=logs/resume20260905_base_stage0 .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 docs/bench_train.py` を実行。`logs/2b6673ed-497d-435d-a2e8-bdefd85a0b68.txt` に 10 step の損失 18.3334→13.4629（finite）まで保存されたが、その後セッションが中断。ユーザーから再開指示を受けた際、GPU を保持した `profile-20302` が `RangeGeneration` 状態で待機していた。
+
+`nsys stop --session=profile-20302` が完了しないため、`nsys shutdown --session=profile-20302 --kill=sigterm` で当該診断だけ終了し、GPU メモリ解放を確認。残った `.qdstrm` は `QdstrmImporter` で incomplete/invalid と判定された。**プロファイルの性能数値は得られていない**。Exp 23 の full run は中断前に正常終了しており、この問題の影響を受けない。
+
+### Exp 24: bigram 表を 2 倍にする
+
+`BIGRAM_VOCAB_SIZE=754560`（既定 377280）、他のハイパーパラメータは Exp 23 と同じ。追加メモリの見積もりは 3.24 GiB（bf16 重み・勾配、fp32 の Adam 状態 2 個）。まず `env BIGRAM_VOCAB_SIZE=754560 BENCH_STAGES=0,847,1205 .venv/bin/torchrun --standalone --nproc_per_node=1 docs/bench_train.py` で確認。
+
+**事前確認**: `logs/53f59597-6e83-4949-ac4a-6cbaaf3d6f4b.txt`。序盤 10 step の損失 18.3334→13.4581（finite）。stage 0 / 847 / 1205 の平均時間は 389.1 / 1228.8 / 1436.9 ms、最大 allocated 24,901.7 MiB。full softmax を含め OOM なし。これらは短い診断の値であり、full run の時間とは直接比較しない。
+
+**full run 実行中**: `env BIGRAM_VOCAB_SIZE=754560 ./run.sh`、`logs/ed7ee42e-3f9b-4894-89fd-56ada99f1f33.txt`。まず学習 step 数を維持して精度への効果を測る。採用候補となる精度改善が得られた場合に、別 run で step 数を減らして train_time を評価する。

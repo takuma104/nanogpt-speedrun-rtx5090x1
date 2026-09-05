@@ -1328,7 +1328,8 @@ class GPT(nn.Module):
     def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        mlp_hdim = 4 * model_dim
+        mlp_hdim = int(os.environ.get("MLP_HIDDEN_DIM", 4 * model_dim))
+        assert mlp_hdim > 0 and mlp_hdim % 128 == 0
         self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
         self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
@@ -1350,7 +1351,7 @@ class GPT(nn.Module):
         )
         self.register_buffer(
             "_mlp_down_weight_partial_amax",
-            torch.empty(12, 576, dtype=torch.float32),
+            torch.empty(12, triton.cdiv(mlp_hdim, 64) * triton.cdiv(model_dim, 64), dtype=torch.float32),
             persistent=False,
         )
 
@@ -1980,7 +1981,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", 1270))  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 35))  # number of steps to continue training at final lr and ws (15 in the reference; +20 buys back the sampled-softmax bias)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1992,7 +1993,7 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 15 // 2
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 50304 * 15 // 2))
     bigram_dim: int = 768
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
@@ -2403,6 +2404,14 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"Training hyperparameters: {args}")
+_experiment_env_keys = {
+    "GRAD_ACCUM_STEPS", "MAX_MICRO_BATCH_TOKENS", "NUM_SCHEDULED_ITERATIONS",
+    "NUM_EXTENSION_ITERATIONS", "MLP_HIDDEN_DIM", "BIGRAM_VOCAB_SIZE",
+    "MLP_FP8_BWD", "DISABLE_FP8", "DISABLE_SNS", "CE_CHUNK_ROWS",
+    "SNS_P12", "SNS_P3_RAMP", "SNS_FULL_SOFTMAX_STEPS", "SNS_START", "SNS_LOGQ_SCALE",
+}
+print0(f"Experiment overrides: { {k: os.environ[k] for k in sorted(_experiment_env_keys) if k in os.environ} }")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
